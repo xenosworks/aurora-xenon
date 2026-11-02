@@ -1389,13 +1389,17 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
   }
 #endif
   // The cache waits for frames in flight until a draw fits, so a draw is skipped only when this frame's own vertices
-  // leave no room once every frame before it is done: the cache is too small for the game.
+  // leave no room once every frame before it is done: the cache is too small for the game, or those vertices, staying
+  // where they are, split its free space into runs shorter than the draw (decode::VertexCache::place).
   if (state.verticesSkipped != 0) {
+    const auto noRoom = g_cache.take_no_room();
     Log.error(
         "No room for the vertices of {} draws in the vertex cache's {} bytes beside this frame's own, with every "
-        "frame before it done; they were skipped. AURORA_VULKAN4XENON_VERTEX_CACHE_BYTES is too small for this "
-        "game",
-        state.verticesSkipped, VertexCacheSize);
+        "frame before it done; they were skipped. The last needed {} KB, with {} KB free in runs of at most {} KB and "
+        "{} KB this frame's: free runs shorter than the draw with free space enough are a fragmented cache, too little "
+        "free space one too small (AURORA_VULKAN4XENON_VERTEX_CACHE_BYTES)",
+        state.verticesSkipped, VertexCacheSize, noRoom.size / 1024, noRoom.free / 1024, noRoom.longestRun / 1024,
+        noRoom.frameBytes / 1024);
   }
   after_present();
   expire_texture_sets();

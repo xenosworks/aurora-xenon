@@ -227,8 +227,9 @@ public:
   // Where a draw's vertices are: the key's entry, now in use by this frame, or new space for size bytes, which the
   // caller decodes into. A draw with no key gets space that no key finds. When no space is free, it waits for the
   // oldest frame in flight to be done, frees what that frame held, and tries again, until the draw fits. None only when
-  // it can't wait, or when every frame before this one is done and the draw still doesn't fit beside this frame's own:
-  // a cache smaller than one frame's vertices.
+  // it can't wait, or when every frame before this one is done and the draw still doesn't fit beside this frame's own
+  // entries, which stay where they are: a cache smaller than one frame's vertices, or one whose free space those
+  // entries split into runs shorter than the draw.
   struct Place {
     uint64_t offset;
     bool decoded; // it holds the draw's vertices already
@@ -261,6 +262,16 @@ public:
   Stats take_stats() noexcept { return std::exchange(m_stats, Stats{}); }
   uint64_t frame_bytes() const noexcept { return m_frameBytes; }
 
+  // Since the last call, the last draw place found no room for: its size, the longest free run and all the free space
+  // then, and this frame's own bytes. A run shorter than the draw with free space enough for it is a fragmented cache.
+  struct NoRoom {
+    uint64_t size = 0;
+    uint64_t longestRun = 0;
+    uint64_t free = 0;
+    uint64_t frameBytes = 0;
+  };
+  NoRoom take_no_room() noexcept { return std::exchange(m_noRoom, NoRoom{}); }
+
 private:
   static constexpr uint32_t None = UINT32_MAX;
   struct Entry {
@@ -284,6 +295,7 @@ private:
 
   uint64_t m_framesInFlight;
   FrameWaiter m_waitForFrame;
+  uint64_t m_capacity;
   uint64_t m_frame = 0;
   // The newest frame known done: entries it or earlier frames used last may be evicted.
   uint64_t m_done = 0;
@@ -298,5 +310,6 @@ private:
   std::map<uint64_t, uint64_t> m_freeByOffset;
   std::multimap<uint64_t, uint64_t> m_freeBySize;
   Stats m_stats;
+  NoRoom m_noRoom;
 };
 } // namespace aurora::gfx::vulkan4xenon::decode

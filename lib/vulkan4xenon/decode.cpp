@@ -929,7 +929,7 @@ void VertexKeys::compute(std::span<const KeyedDraw> draws, Pool verts, Pool stor
 }
 
 VertexCache::VertexCache(uint64_t capacity, uint64_t framesInFlight, FrameWaiter waitForFrame)
-: m_framesInFlight(framesInFlight), m_waitForFrame(std::move(waitForFrame)) {
+: m_framesInFlight(framesInFlight), m_waitForFrame(std::move(waitForFrame)), m_capacity(capacity) {
   release(0, capacity);
 }
 
@@ -962,6 +962,10 @@ std::optional<VertexCache::Place> VertexCache::place(const std::optional<DecodeK
   while (!(offset = allocate(rounded))) {
     if (!evict_oldest() && !wait_for_oldest_frame()) {
       ++m_stats.failures;
+      m_noRoom = {.size = rounded,
+                  .longestRun = m_freeBySize.empty() ? 0 : m_freeBySize.rbegin()->first,
+                  .free = m_capacity - m_used,
+                  .frameBytes = m_frameBytes};
       return std::nullopt;
     }
   }
