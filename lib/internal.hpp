@@ -281,11 +281,13 @@ public:
   constexpr ByteBuffer() noexcept = default;
   explicit ByteBuffer(size_t size) noexcept
   : m_data(static_cast<uint8_t*>(calloc(1, size))), m_length(size), m_capacity(size) {}
-  explicit ByteBuffer(uint8_t* data, size_t size) noexcept : m_data(data), m_capacity(size), m_owned(false) {}
+  // Over memory it doesn't own and can't grow, such as a frame's pool, which an overflow's message names.
+  explicit ByteBuffer(uint8_t* data, size_t size, const char* pool = "frame") noexcept
+  : m_data(data), m_capacity(size), m_owned(false), m_pool(pool) {}
   ~ByteBuffer() noexcept { release(); }
 
   ByteBuffer(ByteBuffer&& rhs) noexcept
-  : m_data(rhs.m_data), m_length(rhs.m_length), m_capacity(rhs.m_capacity), m_owned(rhs.m_owned) {
+  : m_data(rhs.m_data), m_length(rhs.m_length), m_capacity(rhs.m_capacity), m_owned(rhs.m_owned), m_pool(rhs.m_pool) {
     rhs.m_data = nullptr;
     rhs.m_length = 0;
     rhs.m_capacity = 0;
@@ -301,6 +303,7 @@ public:
     m_length = rhs.m_length;
     m_capacity = rhs.m_capacity;
     m_owned = rhs.m_owned;
+    m_pool = rhs.m_pool;
     rhs.m_data = nullptr;
     rhs.m_length = 0;
     rhs.m_capacity = 0;
@@ -365,6 +368,7 @@ private:
   size_t m_length = 0;
   size_t m_capacity = 0;
   bool m_owned = true;
+  const char* m_pool = nullptr;
 
   void resize(size_t size, bool zeroed) {
     if (size == 0) {
@@ -374,7 +378,9 @@ private:
       m_owned = true;
     } else if (size > m_capacity) {
       if (!m_owned) {
-        abort();
+        Module{"aurora::gfx"}.fatal(
+            "A frame needs {} bytes of the {} pool, which holds {}: its AURORA_*_POOL_SIZE is too small", size, m_pool,
+            m_capacity);
       }
       if (size < m_capacity * 2) {
         size = m_capacity * 2;

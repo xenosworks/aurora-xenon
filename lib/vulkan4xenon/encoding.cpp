@@ -1280,11 +1280,11 @@ bool begin_frame(detail::FramePacket& frame) noexcept {
   state.efbDepth = g_efbDepth;
   state.efbMultisampled = g_efbMultisampled;
   state.efbDepthRead = g_efbDepthRead;
-  frame.verts = ByteBuffer{state.verts.get(), VertexBufferSize};
-  frame.uniforms = ByteBuffer{state.uniformData.get(), UniformBufferSize};
-  frame.indices = ByteBuffer{state.indexData.get(), IndexBufferSize};
-  frame.storage = ByteBuffer{state.storage.get(), StorageBufferSize};
-  frame.textureUpload = ByteBuffer{state.uploadData.get(), TextureUploadSize};
+  frame.verts = ByteBuffer{state.verts.get(), VertexBufferSize, "vertex"};
+  frame.uniforms = ByteBuffer{state.uniformData.get(), UniformBufferSize, "uniform"};
+  frame.indices = ByteBuffer{state.indexData.get(), IndexBufferSize, "index"};
+  frame.storage = ByteBuffer{state.storage.get(), StorageBufferSize, "storage"};
+  frame.textureUpload = ByteBuffer{state.uploadData.get(), TextureUploadSize, "texture upload"};
   return true;
 }
 

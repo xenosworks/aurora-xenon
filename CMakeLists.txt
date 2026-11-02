@@ -54,7 +54,8 @@ else ()
   set(AURORA_RMLUI_DRAWS OFF)
 endif ()
 # The streaming pools a frame records into, in bytes; Dawn keeps several copies of them for staging. Overflowing the
-# first four aborts, so a game sizes them from its peaks. The defaults are 24, 5, 2, 8 and 24 MiB.
+# first four ends the game, logging which pool, so a game sizes them from its peaks. The defaults are 24, 5, 2, 8 and
+# 24 MiB.
 set(AURORA_UNIFORM_POOL_SIZE 25165824 CACHE STRING "Bytes of uniform data a frame can record")
 set(AURORA_VERTEX_POOL_SIZE 5242880 CACHE STRING "Bytes of vertex data a frame can record")
 set(AURORA_INDEX_POOL_SIZE 2097152 CACHE STRING "Bytes of index data a frame can record")
