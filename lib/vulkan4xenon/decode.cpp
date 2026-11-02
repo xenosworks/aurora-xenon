@@ -282,12 +282,22 @@ enum class Op : uint8_t {
   S8x3,
   S16x2Be,
   S16x2Le,
+  F32x2Be,
+  F32x2Le,
   Rgba8,
+};
+
+// Where a step finds its attribute's value: at a u16 or u8 index into its array, or in the vertex itself.
+enum class Source : uint8_t {
+  Index16,
+  Index8,
+  Direct,
 };
 
 struct Step {
   Op op;
-  uint8_t inOffset;   // the attribute's byte, or its index, in the GX vertex
+  Source source;
+  uint8_t inOffset;   // the attribute's index, or its value, in the GX vertex
   uint16_t outOffset; // in the decoded vertex
   uint32_t stride;    // between array elements
   size_t arrayStart;  // in the storage pool
@@ -307,26 +317,40 @@ bool op_for(const gx::AttrConfig& mapping, const Attribute& attribute, Op& op) n
     op = Op::PnmtxDirect;
     return mapping.attrType == GX_DIRECT;
   }
-  if (mapping.attrType != GX_INDEX16 || attribute.slice != NbtSlice::Normal) {
+  if ((mapping.attrType != GX_INDEX16 && mapping.attrType != GX_INDEX8 && mapping.attrType != GX_DIRECT) ||
+      attribute.slice != NbtSlice::Normal) {
     return false;
   }
+  // A direct value is the vertex's own bytes, big-endian, as attr_address reads them; an indexed one is its array's.
+  const bool le = mapping.attrType != GX_DIRECT && mapping.le;
   if (attribute.attr == GX_VA_CLR0 || attribute.attr == GX_VA_CLR1) {
     op = Op::Rgba8;
     return mapping.compType == GX_RGBA8;
   }
   if (attribute.attr >= GX_VA_TEX0 && attribute.attr <= GX_VA_TEX7) {
-    op = mapping.le ? Op::S16x2Le : Op::S16x2Be;
-    return mapping.cnt == 2 && mapping.compType == GX_S16;
+    if (mapping.cnt != 2) {
+      return false;
+    }
+    switch (mapping.compType) {
+    case GX_S16:
+      op = le ? Op::S16x2Le : Op::S16x2Be;
+      return true;
+    case GX_F32:
+      op = le ? Op::F32x2Le : Op::F32x2Be;
+      return true;
+    default:
+      return false;
+    }
   }
   if ((attribute.attr != GX_VA_POS && attribute.attr != GX_VA_NRM) || mapping.cnt != 3) {
     return false;
   }
   switch (mapping.compType) {
   case GX_S16:
-    op = mapping.le ? Op::S16x3Le : Op::S16x3Be;
+    op = le ? Op::S16x3Le : Op::S16x3Be;
     return true;
   case GX_F32:
-    op = mapping.le ? Op::F32x3Le : Op::F32x3Be;
+    op = le ? Op::F32x3Le : Op::F32x3Be;
     return true;
   case GX_S8:
     op = Op::S8x3;
@@ -336,7 +360,7 @@ bool op_for(const gx::AttrConfig& mapping, const Attribute& attribute, Op& op) n
   }
 }
 
-// The bytes an operation reads from an array element.
+// The bytes an operation reads from an array element, or from the vertex for a direct value.
 size_t element_size(Op op) noexcept {
   switch (op) {
   case Op::S16x3Be:
@@ -345,6 +369,9 @@ size_t element_size(Op op) noexcept {
   case Op::F32x3Be:
   case Op::F32x3Le:
     return 12;
+  case Op::F32x2Be:
+  case Op::F32x2Le:
+    return 8;
   case Op::S8x3:
     return 3;
   default:
@@ -364,9 +391,18 @@ bool make_plan(const gx::ShaderConfig& config, const VertexLayout& layout, const
   for (const auto& attribute : layout.attributes) {
     const auto& mapping = config.attrs[attribute.attr];
     Step& step = steps[count++];
-    // A byte or a u16 index, inside the vertex.
-    if (!op_for(mapping, attribute, step.op) ||
-        mapping.offset + (step.op == Op::PnmtxDirect ? 1u : 2u) > config.vtxStride) {
+    if (!op_for(mapping, attribute, step.op)) {
+      return false;
+    }
+    step.source = mapping.attrType == GX_DIRECT   ? Source::Direct
+                  : mapping.attrType == GX_INDEX8 ? Source::Index8
+                                                  : Source::Index16;
+    // The byte or the u8 or u16 index, or the direct value, inside the vertex.
+    const size_t inSize = step.op == Op::PnmtxDirect      ? 1
+                          : step.source == Source::Direct ? element_size(step.op)
+                          : step.source == Source::Index8 ? 1
+                                                          : 2;
+    if (mapping.offset + inSize > config.vtxStride) {
       return false;
     }
     step.inOffset = mapping.offset;
@@ -376,7 +412,7 @@ bool make_plan(const gx::ShaderConfig& config, const VertexLayout& layout, const
     step.attribute = &attribute;
     step.arrayStart = 0;
     step.indexLimit = 0;
-    if (step.op == Op::PnmtxDirect) {
+    if (step.source == Source::Direct) {
       continue;
     }
     step.arrayStart = draw.immediateData.arrayStart[attribute.attr - GX_VA_POS];
@@ -411,12 +447,15 @@ ALWAYS_INLINE void run_step(const Step& step, const gx::ShaderConfig& config, co
     write_floats(value, f, 1);
     return;
   }
-  const u32 index = be16(in + step.inOffset);
-  if (index >= step.indexLimit) [[unlikely]] {
-    decode_attribute(config, *step.attribute, immediates, vertex, verts, storage, reach, value);
-    return;
+  const uint8_t* src = in + step.inOffset;
+  if (step.source != Source::Direct) {
+    const u32 index = step.source == Source::Index8 ? u32{in[step.inOffset]} : be16(in + step.inOffset);
+    if (index >= step.indexLimit) [[unlikely]] {
+      decode_attribute(config, *step.attribute, immediates, vertex, verts, storage, reach, value);
+      return;
+    }
+    src = storage.data() + step.arrayStart + size_t{index} * step.stride;
   }
-  const uint8_t* src = storage.data() + step.arrayStart + size_t{index} * step.stride;
   switch (step.op) {
   case Op::S16x3Be:
     f[0] = s16(be16(src), step.scale);
@@ -456,6 +495,16 @@ ALWAYS_INLINE void run_step(const Step& step, const gx::ShaderConfig& config, co
   case Op::S16x2Le:
     f[0] = s16(le16(src), step.scale);
     f[1] = s16(le16(src + 2), step.scale);
+    write_floats(value, f, 2);
+    break;
+  case Op::F32x2Be:
+    f[0] = std::bit_cast<float>(be32(src));
+    f[1] = std::bit_cast<float>(be32(src + 4));
+    write_floats(value, f, 2);
+    break;
+  case Op::F32x2Le:
+    f[0] = std::bit_cast<float>(le32(src));
+    f[1] = std::bit_cast<float>(le32(src + 4));
     write_floats(value, f, 2);
     break;
   case Op::Rgba8:
