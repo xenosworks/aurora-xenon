@@ -194,6 +194,33 @@ uint32_t g_cacheFrames = 0;
 uint64_t g_gxDraws = 0;
 uint64_t g_layOutNs = 0;
 uint64_t g_recordNs = 0;
+// And lay_out_pass's passes with a GX draw, the most draws in one, and its time by stage: walking the commands (with
+// the pipeline lookups in it, timed apart too), keying the draws, placing them in the vertex cache, decoding the misses
+// and forgetting reads past arrays.
+struct LayOutStats {
+  uint64_t passes = 0;
+  uint64_t mostDraws = 0;
+  uint64_t walkNs = 0;
+  uint64_t lookups = 0;
+  uint64_t lookupNs = 0;
+  uint64_t keysNs = 0;
+  uint64_t placeNs = 0;
+  uint64_t decodeNs = 0;
+  uint64_t decodedDraws = 0;
+  uint64_t decodedVertices = 0;
+  uint64_t forgetNs = 0;
+};
+LayOutStats g_layOut;
+
+// What a clock read costs: each stage's time holds about one.
+double clock_read_ns() noexcept {
+  constexpr int Reads = 1000;
+  auto mark = std::chrono::steady_clock::now();
+  for (int i = 0; i < Reads; ++i) {
+    (void)std::chrono::steady_clock::now();
+  }
+  return static_cast<double>(decode::lap(mark)) / Reads;
+}
 // The render worker's time in vkAcquireNextImageKHR, which waits for the display, since the benchmark last asked.
 std::atomic<uint64_t> g_acquireNs = 0;
 #endif
@@ -624,6 +651,19 @@ VkDescriptorSet pass_fog_range(std::span<const uint8_t> storage, uint32_t base, 
   return set;
 }
 
+// A draw's pipeline, null until it exists; timed with diagnostics.
+const backend::Pipeline* look_up_pipeline(PipelineRef ref) noexcept {
+#ifdef AURORA_DIAGNOSTICS
+  auto mark = std::chrono::steady_clock::now();
+  const backend::Pipeline* pipeline = get_main_pipeline(ref);
+  g_layOut.lookupNs += decode::lap(mark);
+  ++g_layOut.lookups;
+  return pipeline;
+#else
+  return get_main_pipeline(ref);
+#endif
+}
+
 // Whether a draw's entry can hold an index list and its first vertices: a draw with no indices of its own, whose places
 // fit 16 bits. The layer splits longer draws itself (vulkan4xenon's docs/SUPPORT.md, Commands).
 bool listable(const gx::DrawData& data) noexcept { return data.indexCount == 0 && data.vtxCount <= MaxListedVertices; }
@@ -691,6 +731,9 @@ void forget_reads_past_arrays(FrameState& state, std::span<const uint8_t> verts,
 // space, on two threads (decode::decode_pass). The keys are hashed first, on the same two threads (decode::VertexKeys).
 void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const detail::FrameOp& op,
                   detail::RenderPass& pass) noexcept {
+#ifdef AURORA_DIAGNOSTICS
+  auto mark = std::chrono::steady_clock::now();
+#endif
   g_passDraws.clear();
   g_keyedDraws.clear();
   g_keyedPlaces.clear();
@@ -714,7 +757,7 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
     }
     if (data.pipeline != ref) {
       ref = data.pipeline;
-      pipeline = get_main_pipeline(ref);
+      pipeline = look_up_pipeline(ref);
     }
     if (!pipeline) {
       continue;
@@ -730,10 +773,16 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
         {pipeline->decodeFormat, &pipeline->shaderConfig, &pipeline->vertexLayout, &data, listable(data)});
     g_keyedPlaces.push_back(g_passDraws.size() - 1);
   }
+#ifdef AURORA_DIAGNOSTICS
+  g_layOut.walkNs += decode::lap(mark);
+#endif
   g_drawKeys.resize(g_keyedDraws.size());
   g_drawEnds.resize(g_keyedDraws.size());
   g_drawHits.assign(g_keyedDraws.size(), false);
   g_keys.compute(g_keyedDraws, verts, storage, g_drawKeys, g_drawEnds, backend::limits().contentHashes);
+#ifdef AURORA_DIAGNOSTICS
+  g_layOut.keysNs += decode::lap(mark);
+#endif
   for (size_t i = 0; i < g_keyedDraws.size(); ++i) {
     decode::KeyedDraw& keyed = g_keyedDraws[i];
     PassDraw& draw = g_passDraws[g_keyedPlaces[i]];
@@ -768,8 +817,25 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
       g_decodeDraws.push_back(i);
     }
   }
+#ifdef AURORA_DIAGNOSTICS
+  g_layOut.placeNs += decode::lap(mark);
+#endif
   decode::decode_pass(g_decodeJobs, verts, storage);
+#ifdef AURORA_DIAGNOSTICS
+  g_layOut.decodeNs += decode::lap(mark);
+  g_layOut.decodedDraws += g_decodeJobs.size();
+  for (const auto& job : g_decodeJobs) {
+    g_layOut.decodedVertices += job.list != nullptr ? job.list->firsts.size() : job.draw->vtxCount;
+  }
+#endif
   forget_reads_past_arrays(state, verts, storage);
+#ifdef AURORA_DIAGNOSTICS
+  g_layOut.forgetNs += decode::lap(mark);
+  if (!g_passDraws.empty()) {
+    ++g_layOut.passes;
+    g_layOut.mostDraws = std::max<uint64_t>(g_layOut.mostDraws, g_passDraws.size());
+  }
+#endif
 }
 
 // glsl.hpp's contract: one decoded stream, the draw's uniform pieces at their offsets, its textures, and its current
@@ -1407,11 +1473,24 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
         stats.peakUsedBytes / MiB, VertexCacheSize / MiB, stats.waits, stats.waitNs / 1e6, stats.longestWaitNs / 1e6,
         g_lists.take_built(), g_lists.size(), g_lists.bytes() / MiB);
     const double draws = static_cast<double>(std::max<uint64_t>(g_gxDraws, 1));
-    Log.info("GX draws, last 1000 frames: {}, laid out in {:.0f} ns and recorded in {:.0f} ns a draw", g_gxDraws,
-             g_layOutNs / draws, g_recordNs / draws);
+    const auto keys = g_keys.take_stats();
+    const auto helper = decode::take_helper_stats();
+    const auto& layOut = g_layOut;
+    Log.info(
+        "GX draws, last 1000 frames: {}, laid out in {:.0f} ns and recorded in {:.0f} ns a draw; {} passes, at "
+        "most {} draws in one; laying out a draw: walking {:.0f} ns ({} pipeline lookups, {:.0f} ns a draw), "
+        "keying {:.0f} (arrays {:.0f} for {} lookups and {} arrays, hashing {:.0f} for {} ranges of {} KB, keys "
+        "{:.0f}), placing {:.0f}, decoding {:.0f} ({} draws, {} vertices; {} passes shared, {:.0f} us waiting for "
+        "the helper), forgetting {:.0f}; a clock read takes {:.0f} ns",
+        g_gxDraws, g_layOutNs / draws, g_recordNs / draws, layOut.passes, layOut.mostDraws, layOut.walkNs / draws,
+        layOut.lookups, layOut.lookupNs / draws, layOut.keysNs / draws, keys.gatherNs / draws, keys.lookups,
+        keys.arrays, keys.hashNs / draws, keys.ranges, keys.hashedBytes / 1024, keys.keyNs / draws,
+        layOut.placeNs / draws, layOut.decodeNs / draws, layOut.decodedDraws, layOut.decodedVertices, helper.passes,
+        helper.waitNs / 1e3, layOut.forgetNs / draws, clock_read_ns());
     g_gxDraws = 0;
     g_layOutNs = 0;
     g_recordNs = 0;
+    g_layOut = {};
   }
 #endif
   // The cache waits for frames in flight until a draw fits, so a draw is skipped only when this frame's own vertices

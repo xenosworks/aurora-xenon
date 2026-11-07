@@ -8,6 +8,9 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <array>
+#ifdef AURORA_DIAGNOSTICS
+#include <chrono>
+#endif
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -23,6 +26,16 @@ using AttrFormat = glsl::AttrFormat;
 using NbtSlice = glsl::NbtSlice;
 using Attribute = glsl::Attribute;
 using VertexLayout = glsl::VertexLayout;
+
+#ifdef AURORA_DIAGNOSTICS
+// The nanoseconds since mark, which moves to now: a stage's time, for the render worker's stats.
+inline uint64_t lap(std::chrono::steady_clock::time_point& mark) noexcept {
+  const auto now = std::chrono::steady_clock::now();
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count();
+  mark = now;
+  return static_cast<uint64_t>(ns);
+}
+#endif
 
 // Render worker, per draw: the draw's vertices in layout's stream, from the frame's vertex and storage pools; a line or
 // point draw's corners (glsl::write_corners), glsl::stream_vertices of them.
@@ -85,11 +98,12 @@ struct DecodeJob {
 void decode_pass(std::span<DecodeJob> jobs, std::span<const uint8_t> verts, std::span<const uint8_t> storage) noexcept;
 
 // Render worker: since the last call, the passes decode_pass shared with its helper, their vertices, and the helper's
-// share of them.
+// share of them; with diagnostics, the time the worker waited for the helper to finish, decoding or hashing.
 struct HelperStats {
   uint64_t passes = 0;
   uint64_t vertices = 0;
   uint64_t helperVertices = 0;
+  uint64_t waitNs = 0;
 };
 HelperStats take_helper_stats() noexcept;
 
@@ -186,7 +200,25 @@ public:
   // From the last compute: the run_hash of a draw's vertex bytes as its key has it, for a draw with a key.
   uint64_t vertex_hash(size_t draw) const noexcept { return m_vertexHashes[draw]; }
 
+#ifdef AURORA_DIAGNOSTICS
+  // Since the last call: compute's time finding what to hash (looking up each indexed attribute's array), hashing it,
+  // and building the keys; the lookups, the arrays new to the frame, and the ranges and bytes hashed here.
+  struct Stats {
+    uint64_t gatherNs = 0;
+    uint64_t hashNs = 0;
+    uint64_t keyNs = 0;
+    uint64_t lookups = 0;
+    uint64_t arrays = 0;
+    uint64_t ranges = 0;
+    uint64_t hashedBytes = 0;
+  };
+  Stats take_stats() noexcept { return std::exchange(m_stats, Stats{}); }
+#endif
+
 private:
+#ifdef AURORA_DIAGNOSTICS
+  Stats m_stats;
+#endif
   struct Array {
     uint32_t end;
     uint32_t range; // its place in m_ranges while this pass hashes it, or Hashed

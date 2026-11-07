@@ -805,7 +805,14 @@ uint64_t run_shared(SharedWork work, bool share) noexcept {
   }
   helper().begin(work);
   work.take(work.work);
+#ifdef AURORA_DIAGNOSTICS
+  auto mark = std::chrono::steady_clock::now();
+  const uint64_t taken = helper().end();
+  g_stats.waitNs += lap(mark);
+  return taken;
+#else
   return helper().end();
+#endif
 }
 } // namespace
 
@@ -877,6 +884,10 @@ uint64_t decode_format(const gx::ShaderConfig& config, const VertexLayout& layou
 
 void VertexKeys::compute(std::span<const KeyedDraw> draws, Pool verts, Pool storage,
                          std::span<std::optional<DecodeKey>> keys, std::span<ArrayEnds> ends, bool poolHashes) {
+#ifdef AURORA_DIAGNOSTICS
+  auto mark = std::chrono::steady_clock::now();
+  const size_t arraysBefore = m_arrays.size();
+#endif
   m_ranges.clear();
   m_vertexRanges.clear();
   m_vertexHashes.assign(draws.size(), 0);
@@ -922,6 +933,15 @@ void VertexKeys::compute(std::span<const KeyedDraw> draws, Pool verts, Pool stor
       }
     }
   }
+#ifdef AURORA_DIAGNOSTICS
+  m_stats.gatherNs += lap(mark);
+  m_stats.lookups += m_drawArrays.size();
+  m_stats.arrays += m_arrays.size() - arraysBefore;
+  m_stats.ranges += m_ranges.size();
+  for (const HashRange& range : m_ranges) {
+    m_stats.hashedBytes += range.size;
+  }
+#endif
   hash_ranges(m_ranges);
   for (size_t i = 0; i < draws.size(); ++i) {
     if (m_vertexRanges[i] != NoRange && m_vertexRanges[i] != PoolHash) {
@@ -934,6 +954,9 @@ void VertexKeys::compute(std::span<const KeyedDraw> draws, Pool verts, Pool stor
       array.range = Hashed;
     }
   }
+#ifdef AURORA_DIAGNOSTICS
+  m_stats.hashNs += lap(mark);
+#endif
   // Each draw's key: its format, vertex count and those hashes, by attribute. The bytes are written in place, where a
   // vector's inserts took 15 calls a draw.
   for (size_t i = 0; i < draws.size(); ++i) {
@@ -975,6 +998,9 @@ void VertexKeys::compute(std::span<const KeyedDraw> draws, Pool verts, Pool stor
       keys[i] = DecodeKey{hash.low64, hash.high64};
     }
   }
+#ifdef AURORA_DIAGNOSTICS
+  m_stats.keyNs += lap(mark);
+#endif
 }
 
 VertexCache::VertexCache(uint64_t capacity, uint64_t framesInFlight, FrameWaiter waitForFrame)
