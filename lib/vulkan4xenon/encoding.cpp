@@ -187,6 +187,10 @@ std::chrono::steady_clock::time_point g_nextDepthPeek{};
 std::atomic<uint64_t> g_decodedPeak = 0;
 // Frames since the vertex cache's stats were last logged.
 uint32_t g_cacheFrames = 0;
+// Since then, the passes' GX draws and the render worker's time laying them out (lay_out_pass) and recording them.
+uint64_t g_gxDraws = 0;
+uint64_t g_layOutNs = 0;
+uint64_t g_recordNs = 0;
 // The render worker's time in vkAcquireNextImageKHR, which waits for the display, since the benchmark last asked.
 std::atomic<uint64_t> g_acquireNs = 0;
 #endif
@@ -1101,7 +1105,13 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
         .clearValueCount = pass.hasDepth ? 2u : 1u,
         .pClearValues = clearValues.data(),
     };
+#ifdef AURORA_DIAGNOSTICS
+    const auto layOutStart = std::chrono::steady_clock::now();
+#endif
     lay_out_pass(frame, state, op, pass);
+#ifdef AURORA_DIAGNOSTICS
+    const auto recordStart = std::chrono::steady_clock::now();
+#endif
     vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
     reset_bindings();
     size_t gxDraws = 0;
@@ -1137,6 +1147,12 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
       }
     }
     vkCmdEndRenderPass(cmd);
+#ifdef AURORA_DIAGNOSTICS
+    g_gxDraws += g_passDraws.size();
+    g_layOutNs += std::chrono::duration_cast<std::chrono::nanoseconds>(recordStart - layOutStart).count();
+    g_recordNs +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - recordStart).count();
+#endif
     if (multisampled != nullptr && depthRead) {
       resolve_depth(*depth, *readDepth, cmd);
     }
@@ -1386,6 +1402,12 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
         stats.missBytes / MiB, stats.evictions, stats.forgotten, stats.failures, stats.peakFrameBytes / MiB,
         stats.peakUsedBytes / MiB, VertexCacheSize / MiB, stats.waits, stats.waitNs / 1e6, stats.longestWaitNs / 1e6,
         g_lists.take_built(), g_lists.size(), g_lists.bytes() / MiB);
+    const double draws = static_cast<double>(std::max<uint64_t>(g_gxDraws, 1));
+    Log.info("GX draws, last 1000 frames: {}, laid out in {:.0f} ns and recorded in {:.0f} ns a draw", g_gxDraws,
+             g_layOutNs / draws, g_recordNs / draws);
+    g_gxDraws = 0;
+    g_layOutNs = 0;
+    g_recordNs = 0;
   }
 #endif
   // The cache waits for frames in flight until a draw fits, so a draw is skipped only when this frame's own vertices
