@@ -1172,42 +1172,59 @@ std::optional<uint64_t> VertexCache::allocate(uint64_t size) {
   }
   const uint64_t runSize = bySize->first;
   const uint64_t offset = bySize->second;
-  m_freeBySize.erase(bySize);
-  m_freeByOffset.erase(offset);
+  m_spareNodes.push_back(m_freeBySize.extract(bySize));
+  m_spareNodes.push_back(m_freeByOffset.extract(offset));
   if (runSize > size) {
-    m_freeByOffset.emplace(offset + size, runSize - size);
-    m_freeBySize.emplace(runSize - size, offset + size);
+    add_run(offset + size, runSize - size);
   }
   return offset;
 }
 
 // Back into the free runs, joined with its neighbours.
 void VertexCache::release(uint64_t offset, uint64_t size) {
-  const auto erase_by_size = [&](uint64_t runOffset, uint64_t runSize) {
-    const auto [first, last] = m_freeBySize.equal_range(runSize);
-    for (auto it = first; it != last; ++it) {
-      if (it->second == runOffset) {
-        m_freeBySize.erase(it);
-        return;
-      }
-    }
-  };
-  auto next = m_freeByOffset.lower_bound(offset);
-  if (next != m_freeByOffset.end() && next->first == offset + size) {
-    size += next->second;
-    erase_by_size(next->first, next->second);
-    next = m_freeByOffset.erase(next);
-  }
+  const auto next = m_freeByOffset.lower_bound(offset);
   if (next != m_freeByOffset.begin()) {
     const auto previous = std::prev(next);
     if (previous->first + previous->second == offset) {
       offset = previous->first;
       size += previous->second;
-      erase_by_size(previous->first, previous->second);
-      m_freeByOffset.erase(previous);
+      take_run(previous);
     }
   }
-  m_freeByOffset.emplace(offset, size);
-  m_freeBySize.emplace(size, offset);
+  if (next != m_freeByOffset.end() && next->first == offset + size) {
+    size += next->second;
+    take_run(next);
+  }
+  add_run(offset, size);
+}
+
+// Inserted as emplace inserts, an equal size after those already there, so best fit picks the same run.
+void VertexCache::add_run(uint64_t offset, uint64_t size) {
+  m_freeByOffset.insert(spare_node(offset, size));
+  m_freeBySize.insert(spare_node(size, offset));
+}
+
+void VertexCache::take_run(FreeRuns::iterator run) {
+  const auto [first, last] = m_freeBySize.equal_range(run->second);
+  for (auto it = first; it != last; ++it) {
+    if (it->second == run->first) {
+      m_spareNodes.push_back(m_freeBySize.extract(it));
+      break;
+    }
+  }
+  m_spareNodes.push_back(m_freeByOffset.extract(run));
+}
+
+VertexCache::FreeRuns::node_type VertexCache::spare_node(uint64_t key, uint64_t value) {
+  if (m_spareNodes.empty()) {
+    FreeRuns made;
+    made.emplace(key, value);
+    return made.extract(made.begin());
+  }
+  FreeRuns::node_type node = std::move(m_spareNodes.back());
+  m_spareNodes.pop_back();
+  node.key() = key;
+  node.mapped() = value;
+  return node;
 }
 } // namespace aurora::gfx::vulkan4xenon::decode

@@ -316,12 +316,17 @@ private:
     uint32_t older;
   };
 
+  using FreeRuns = std::map<uint64_t, uint64_t>;
+
   Place use(uint32_t index, uint64_t size) noexcept;
   void touch(uint32_t index) noexcept;
   void link_newest(uint32_t index) noexcept;
   void unlink(uint32_t index) noexcept;
   std::optional<uint64_t> allocate(uint64_t size);
   void release(uint64_t offset, uint64_t size);
+  void add_run(uint64_t offset, uint64_t size);
+  void take_run(FreeRuns::iterator run);
+  FreeRuns::node_type spare_node(uint64_t key, uint64_t value);
   bool evict_oldest();
   bool wait_for_oldest_frame();
 
@@ -339,8 +344,11 @@ private:
   uint32_t m_oldest = None;
   absl::flat_hash_map<DecodeKey, uint32_t> m_byKey;
   // Free space, by offset and by size, best fit.
-  std::map<uint64_t, uint64_t> m_freeByOffset;
+  FreeRuns m_freeByOffset;
   std::multimap<uint64_t, uint64_t> m_freeBySize;
+  // Nodes of runs taken out of either map, which share node types, reused for new runs: a miss or an eviction then
+  // allocates no node.
+  std::vector<FreeRuns::node_type> m_spareNodes;
   Stats m_stats;
   NoRoom m_noRoom;
 };
