@@ -876,7 +876,51 @@ uint8_t* write_value(uint8_t* out, const T& value) noexcept {
 bool indexed(const gx::AttrConfig& mapping, u32 attr) noexcept {
   return attr >= GX_VA_POS && (mapping.attrType == GX_INDEX8 || mapping.attrType == GX_INDEX16);
 }
+
+// An array's slot in VertexKeys's memo, from its start: Fibonacci hashing's top bits.
+uint32_t memo_slot(uint32_t arrayStart, size_t slots) noexcept {
+  return static_cast<uint32_t>((arrayStart * 0x9E3779B1u) >> (32 - std::countr_zero(slots)));
+}
 } // namespace
+
+const std::vector<uint32_t>& VertexKeys::indexed_attributes(const KeyedDraw& keyed) {
+  if (keyed.layout != m_indexedLayout) {
+    m_indexedLayout = keyed.layout;
+    m_indexedAttributes.clear();
+    for (const auto& attribute : keyed.layout->attributes) {
+      if (indexed(keyed.config->attrs[attribute.attr], attribute.attr)) {
+        m_indexedAttributes.push_back(attribute.attr);
+      }
+    }
+  }
+  return m_indexedAttributes;
+}
+
+uint32_t VertexKeys::array_place(uint32_t arrayStart, Pool storage, bool poolHashes) {
+  auto& [memoStart, memoPlace] = m_arrayMemo[memo_slot(arrayStart, m_arrayMemo.size())];
+  if (memoPlace != NoRange && memoStart == arrayStart) {
+    return memoPlace;
+  }
+  const auto [it, added] = m_arrayPlaces.try_emplace(arrayStart, static_cast<uint32_t>(m_arrays.size()));
+  memoStart = arrayStart;
+  memoPlace = it->second;
+  if (!added) {
+    return it->second;
+  }
+  Array& array = m_arrays.emplace_back(Array{0, NoRange, 0});
+  uint32_t arraySize = 0;
+  if (arrayStart >= sizeof(arraySize) && arrayStart <= storage.size()) {
+    std::memcpy(&arraySize, storage.data() + arrayStart - sizeof(arraySize), sizeof(arraySize));
+    if (arraySize <= storage.size() - arrayStart && poolHashes && arrayStart >= sizeof(arraySize) + sizeof(u64)) {
+      array = {arrayStart + arraySize, Hashed, 0};
+      std::memcpy(&array.hash, storage.data() + arrayStart - sizeof(arraySize) - sizeof(u64), sizeof(u64));
+    } else if (arraySize <= storage.size() - arrayStart) {
+      array = {arrayStart + arraySize, static_cast<uint32_t>(m_ranges.size()), 0};
+      m_ranges.push_back({storage.data() + arrayStart, arraySize, 0});
+    }
+  }
+  return it->second;
+}
 
 uint64_t decode_format(const gx::ShaderConfig& config, const VertexLayout& layout) noexcept {
   std::vector<uint8_t> bytes;
@@ -910,6 +954,7 @@ void VertexKeys::compute(std::span<const KeyedDraw> draws, Pool verts, Pool stor
   m_vertexHashes.assign(draws.size(), 0);
   m_drawArrays.clear();
   m_drawArraysStart.clear();
+  m_indexedLayout = nullptr;
   // What to hash: each draw's vertex bytes, and each array the frame hasn't hashed yet, whole. The size push_array put
   // before an array says where it ends; one that says it passes the pool gets no hash, nor do its draws keys.
   for (const KeyedDraw& keyed : draws) {
@@ -926,28 +971,8 @@ void VertexKeys::compute(std::span<const KeyedDraw> draws, Pool verts, Pool stor
       m_vertexRanges.push_back(static_cast<uint32_t>(m_ranges.size()));
       m_ranges.push_back({verts.data() + start, size, 0});
     }
-    for (const auto& attribute : keyed.layout->attributes) {
-      if (!indexed(keyed.config->attrs[attribute.attr], attribute.attr)) {
-        continue;
-      }
-      const uint32_t arrayStart = draw.immediateData.arrayStart[attribute.attr - GX_VA_POS];
-      const auto [it, added] = m_arrayPlaces.try_emplace(arrayStart, static_cast<uint32_t>(m_arrays.size()));
-      m_drawArrays.push_back(it->second);
-      if (!added) {
-        continue;
-      }
-      Array& array = m_arrays.emplace_back(Array{0, NoRange, 0});
-      uint32_t arraySize = 0;
-      if (arrayStart >= sizeof(arraySize) && arrayStart <= storage.size()) {
-        std::memcpy(&arraySize, storage.data() + arrayStart - sizeof(arraySize), sizeof(arraySize));
-        if (arraySize <= storage.size() - arrayStart && poolHashes && arrayStart >= sizeof(arraySize) + sizeof(u64)) {
-          array = {arrayStart + arraySize, Hashed, 0};
-          std::memcpy(&array.hash, storage.data() + arrayStart - sizeof(arraySize) - sizeof(u64), sizeof(u64));
-        } else if (arraySize <= storage.size() - arrayStart) {
-          array = {arrayStart + arraySize, static_cast<uint32_t>(m_ranges.size()), 0};
-          m_ranges.push_back({storage.data() + arrayStart, arraySize, 0});
-        }
-      }
+    for (const uint32_t attr : indexed_attributes(keyed)) {
+      m_drawArrays.push_back(array_place(draw.immediateData.arrayStart[attr - GX_VA_POS], storage, poolHashes));
     }
   }
 #ifdef AURORA_DIAGNOSTICS
@@ -993,15 +1018,12 @@ void VertexKeys::compute(std::span<const KeyedDraw> draws, Pool verts, Pool stor
     out = write_value(out, m_vertexHashes[i]);
     const uint32_t* places = m_drawArrays.data() + m_drawArraysStart[i];
     bool known = true;
-    for (const auto& attribute : keyed.layout->attributes) {
-      if (!indexed(keyed.config->attrs[attribute.attr], attribute.attr)) {
-        continue;
-      }
-      const uint32_t arrayStart = keyed.draw->immediateData.arrayStart[attribute.attr - GX_VA_POS];
+    for (const uint32_t attr : indexed_attributes(keyed)) {
+      const uint32_t arrayStart = keyed.draw->immediateData.arrayStart[attr - GX_VA_POS];
       const Array& array = m_arrays[*places++];
       known = known && array.range == Hashed;
-      ends[i][attribute.attr - GX_VA_POS] = array.end;
-      out = write_value(out, static_cast<uint32_t>(attribute.attr));
+      ends[i][attr - GX_VA_POS] = array.end;
+      out = write_value(out, attr);
       out = write_value(out, array.end - arrayStart);
       out = write_value(out, array.hash);
     }
