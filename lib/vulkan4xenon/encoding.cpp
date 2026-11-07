@@ -127,10 +127,10 @@ const uint8_t* g_pushedMatrix = nullptr;
 const uint8_t* g_pushedNormalMatrix = nullptr;
 constexpr uint32_t NoLineMask = UINT32_MAX;
 uint32_t g_pushedLineMask = NoLineMask;
-// The texture set last looked up, by its ref: consecutive draws often share one, and texture_set takes a lock and a
-// lookup. A ref's set stays the same while a pass is recorded; expire_texture_sets runs after the frame's last.
-std::optional<BindGroupRef> g_lookedUpRef;
-VkDescriptorSet g_lookedUpSet = VK_NULL_HANDLE;
+// The texture sets looked up this frame, at their ref's low bits, without texture_set's lock and lookup. A ref's set
+// stays the same until expire_texture_sets, after the frame's last pass, which empties this.
+constexpr size_t TextureSetMemoSize = 256;
+std::array<std::pair<BindGroupRef, VkDescriptorSet>, TextureSetMemoSize> g_textureSetMemo{};
 VkDescriptorSet g_boundFogRange = VK_NULL_HANDLE;
 // Render worker: pipelines found, at their ref's low bits, without get_main_pipeline's lock and lookup. The cache
 // keeps each until it shuts down, after the render worker (gfx/frame.cpp, shutdown).
@@ -580,7 +580,16 @@ void reset_bindings() noexcept {
   g_pushedMatrix = nullptr;
   g_pushedNormalMatrix = nullptr;
   g_pushedLineMask = NoLineMask;
-  g_lookedUpRef.reset();
+}
+
+VkDescriptorSet frame_texture_set(BindGroupRef ref) noexcept {
+  auto& [memoRef, memoSet] = g_textureSetMemo[ref % TextureSetMemoSize];
+  if (memoSet != VK_NULL_HANDLE && memoRef == ref) {
+    return memoSet;
+  }
+  memoRef = ref;
+  memoSet = texture_set(ref);
+  return memoSet;
 }
 
 // The set of a range fog table holding factors, one a column: one made before, or a new one, written by the CPU
@@ -870,11 +879,7 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
   }
   const auto& pipeline = *g_currentPipelineObject;
   const VkDeviceSize offset = draw.offset;
-  if (g_lookedUpRef != data.bindGroups.textureBindGroup) {
-    g_lookedUpSet = texture_set(data.bindGroups.textureBindGroup);
-    g_lookedUpRef = data.bindGroups.textureBindGroup;
-  }
-  const VkDescriptorSet textures = g_lookedUpSet;
+  const VkDescriptorSet textures = frame_texture_set(data.bindGroups.textureBindGroup);
   if (textures != g_boundTextures) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 1, 1, &textures, 0, nullptr);
     g_boundTextures = textures;
@@ -1335,6 +1340,7 @@ void shutdown_frames() noexcept {
   reset_bindings();
   g_passDraws.clear();
   g_pipelineMemo = {};
+  g_textureSetMemo = {};
   std::lock_guard lock{g_depthPeekMutex};
   g_depthPeekSlots = {};
   g_depthPeekRequested = false;
@@ -1527,6 +1533,7 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
   }
   after_present();
   expire_texture_sets();
+  g_textureSetMemo = {};
   collect_retired();
 }
 } // namespace aurora::gfx::backend
