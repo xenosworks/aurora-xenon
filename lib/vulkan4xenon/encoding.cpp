@@ -862,10 +862,21 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
 #ifdef AURORA_DIAGNOSTICS
   g_layOut.keysNs += decode::lap(mark);
 #endif
+  // The cache's lookups mostly miss the CPU's caches, so each is started a few draws ahead and they overlap.
+  constexpr size_t LookAhead = 4;
+  const auto prefetch = [](size_t i) {
+    if (i < g_drawKeys.size() && g_drawKeys[i]) {
+      g_cache.prefetch(*g_drawKeys[i]);
+    }
+  };
+  for (size_t i = 0; i < LookAhead; ++i) {
+    prefetch(i);
+  }
   for (size_t i = 0; i < g_keyedDraws.size(); ++i) {
 #ifdef AURORA_DIAGNOSTICS
     PlaceTimer timer;
 #endif
+    prefetch(i + LookAhead);
     decode::KeyedDraw& keyed = g_keyedDraws[i];
     PassDraw& draw = g_passDraws[g_keyedPlaces[i]];
     // A draw with no key has no vertex bytes' hash to find its list by, and is decoded whole each frame.

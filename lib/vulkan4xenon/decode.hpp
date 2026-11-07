@@ -304,6 +304,9 @@ public:
   // The key's entry, now in use by this frame, or none: for a draw whose size is known only once it misses.
   std::optional<Place> find(const DecodeKey& key) noexcept;
 
+  // Starts loading where place or find will look the key up, so a few draws' lookups miss the CPU's caches at once.
+  void prefetch(const DecodeKey& key) const noexcept { m_byKey.prefetch(key); }
+
   // A key whose decode read outside what the key covers: its entry stays until its space is taken, but no draw finds
   // it again.
   void forget(const DecodeKey& key) noexcept;
