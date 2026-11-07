@@ -122,6 +122,8 @@ VkDescriptorSet g_boundTextures = VK_NULL_HANDLE;
 // The uniform set's dynamic offsets last bound, and the vertex cache's offset: consecutive draws often share them.
 std::optional<std::array<uint32_t, gx::UniformPieceCount>> g_boundUniforms;
 std::optional<VkDeviceSize> g_boundVertices;
+// The index buffer bound, at offset 0: draws give their offsets as their first index.
+VkBuffer g_boundIndices = VK_NULL_HANDLE;
 // The position and normal matrices last pushed, by their places in the frame's uniform data, and a line or point
 // draw's texture coordinate mask (glsl.hpp), NoLineMask for none.
 const uint8_t* g_pushedMatrix = nullptr;
@@ -628,6 +630,7 @@ void reset_bindings() noexcept {
   g_boundTextures = VK_NULL_HANDLE;
   g_boundUniforms.reset();
   g_boundVertices.reset();
+  g_boundIndices = VK_NULL_HANDLE;
   g_boundFogRange = VK_NULL_HANDLE;
   g_pushedMatrix = nullptr;
   g_pushedNormalMatrix = nullptr;
@@ -934,6 +937,19 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
 #endif
 }
 
+// count 16-bit indices from offset bytes into buffer. The offset goes in as the draw's first index, which the layer
+// adds to the bound buffer's address as it would the bind's offset (vulkan4xenon: src/queue.c, draw_indexed), so the
+// buffer is bound again only when it changes. Offsets are even: indices are pushed whole, patterns are whole arrays,
+// and the vertex cache's entries start on 16 bytes.
+void draw_indexed(VkBuffer buffer, VkDeviceSize offset, uint32_t count, VkCommandBuffer cmd) noexcept {
+  if (buffer != g_boundIndices) {
+    record_call<vkCmdBindIndexBuffer>("bind index buffer", cmd, buffer, VkDeviceSize{0}, VK_INDEX_TYPE_UINT16);
+    g_boundIndices = buffer;
+  }
+  record_call<vkCmdDrawIndexed>("draw indexed", cmd, count, 1u, static_cast<uint32_t>(offset / sizeof(uint16_t)), 0,
+                                0u);
+}
+
 // glsl.hpp's contract: one decoded stream, the draw's uniform pieces at their offsets, its textures, and its current
 // position matrix pushed.
 void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& draw, VkCommandBuffer cmd) noexcept {
@@ -1011,14 +1027,10 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
   } else if (draw.indices != NoIndices) {
     // Each vertex names its first equal vertex, decoded once: the same triangles, and the GPU transforms each distinct
     // vertex once.
-    record_call<vkCmdBindIndexBuffer>("bind index buffer", cmd, g_vertexCache.buffer, draw.indices,
-                                      VK_INDEX_TYPE_UINT16);
-    record_call<vkCmdDrawIndexed>("draw indexed", cmd, data.vtxCount, 1u, 0u, 0, 0u);
+    draw_indexed(g_vertexCache.buffer, draw.indices, data.vtxCount, cmd);
   } else if (data.indexCount != 0) {
-    const VkBuffer indices = data.patternIndices ? g_indexPatterns.buffer : state.indices.buffer;
-    record_call<vkCmdBindIndexBuffer>("bind index buffer", cmd, indices, VkDeviceSize{data.idxRange.offset},
-                                      VK_INDEX_TYPE_UINT16);
-    record_call<vkCmdDrawIndexed>("draw indexed", cmd, data.indexCount, 1u, 0u, 0, 0u);
+    draw_indexed(data.patternIndices ? g_indexPatterns.buffer : state.indices.buffer, data.idxRange.offset,
+                 data.indexCount, cmd);
   } else {
     record_call<vkCmdDraw>("draw", cmd, data.vtxCount, 1u, 0u, 0u);
   }
