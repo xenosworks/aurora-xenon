@@ -35,6 +35,16 @@ inline uint64_t lap(std::chrono::steady_clock::time_point& mark) noexcept {
   mark = now;
   return static_cast<uint64_t>(ns);
 }
+
+// The CPU's time base, for times too short for a clock read, which takes about 90 ns on the console: ticks of an
+// unknown rate, which the stats find against the clock.
+inline uint64_t ticks() noexcept {
+#if defined(__powerpc__)
+  return __builtin_ppc_get_timebase();
+#else
+  return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
 #endif
 
 // Render worker, per draw: the draw's vertices in layout's stream, from the frame's vertex and storage pools; a line or
@@ -98,12 +108,17 @@ struct DecodeJob {
 void decode_pass(std::span<DecodeJob> jobs, std::span<const uint8_t> verts, std::span<const uint8_t> storage) noexcept;
 
 // Render worker: since the last call, the passes decode_pass shared with its helper, their vertices, and the helper's
-// share of them; with diagnostics, the time the worker waited for the helper to finish, decoding or hashing.
+// share of them; with diagnostics, for the work the worker shared with the helper, decoding or hashing: the time it
+// waited for the helper to finish, the time from sharing it to the helper starting on it, and how often the worker
+// finished it before the helper started.
 struct HelperStats {
   uint64_t passes = 0;
   uint64_t vertices = 0;
   uint64_t helperVertices = 0;
   uint64_t waitNs = 0;
+  uint64_t shared = 0;
+  uint64_t startNs = 0;
+  uint64_t withdrawn = 0;
 };
 HelperStats take_helper_stats() noexcept;
 

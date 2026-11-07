@@ -21,6 +21,7 @@
 #include <cerrno>
 #ifdef AURORA_DIAGNOSTICS
 #include <chrono>
+#include <iterator>
 #endif
 #include <cmath>
 #include <cstdio>
@@ -213,6 +214,11 @@ struct LayOutStats {
   uint64_t decodedDraws = 0;
   uint64_t decodedVertices = 0;
   uint64_t forgetNs = 0;
+  // Placing by the time base: the draws that found their vertices, and those that didn't.
+  uint64_t hitTicks = 0;
+  uint64_t missTicks = 0;
+  uint64_t hits = 0;
+  uint64_t misses = 0;
 };
 LayOutStats g_layOut;
 
@@ -225,6 +231,37 @@ double clock_read_ns() noexcept {
   }
   return static_cast<double>(decode::lap(mark)) / Reads;
 }
+
+// What a time base read costs, in its ticks.
+double tick_read_ticks() noexcept {
+  constexpr int Reads = 1000;
+  const uint64_t start = decode::ticks();
+  for (int i = 0; i < Reads; ++i) {
+    (void)decode::ticks();
+  }
+  return static_cast<double>(decode::ticks() - start) / Reads;
+}
+
+// Recording's calls into vulkan4xenon, by function: their count and their time by the time base.
+struct VulkanCalls {
+  const char* name;
+  uint64_t calls = 0;
+  uint64_t ticks = 0;
+};
+std::vector<VulkanCalls*> g_vulkanCalls;
+// The stats' window start, by the clock and by the time base, for the time base's rate.
+std::chrono::steady_clock::time_point g_windowStart = std::chrono::steady_clock::now();
+uint64_t g_windowTicks = decode::ticks();
+
+// A draw's placing time, by the time base, added to the hits' or the misses'.
+struct PlaceTimer {
+  uint64_t start = decode::ticks();
+  bool missed = false;
+  ~PlaceTimer() {
+    (missed ? g_layOut.missTicks : g_layOut.hitTicks) += decode::ticks() - start;
+    ++(missed ? g_layOut.misses : g_layOut.hits);
+  }
+};
 // The render worker's time in vkAcquireNextImageKHR, which waits for the display, since the benchmark last asked.
 std::atomic<uint64_t> g_acquireNs = 0;
 #endif
@@ -540,9 +577,24 @@ const backend::Pipeline* main_pipeline(PipelineRef ref) noexcept {
   return pipeline;
 }
 
+// A Vulkan call recording a pass's draws; with diagnostics, counted and timed by function.
+template <auto Function, typename... Args>
+void record_call([[maybe_unused]] const char* name, Args... args) noexcept {
+#ifdef AURORA_DIAGNOSTICS
+  static VulkanCalls stats{name};
+  [[maybe_unused]] static const bool listed = (g_vulkanCalls.push_back(&stats), true);
+  const uint64_t start = decode::ticks();
+  Function(args...);
+  stats.ticks += decode::ticks() - start;
+  ++stats.calls;
+#else
+  Function(args...);
+#endif
+}
+
 // A pipeline from get_main_pipeline: create_pipeline makes no prepass.
 void use_pipeline(PipelineRef ref, const backend::Pipeline* pipeline, VkCommandBuffer cmd) noexcept {
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
+  record_call<vkCmdBindPipeline>("bind pipeline", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
   // Another layout leaves the GX sets and push constants undefined.
   if (pipeline->layout != g_currentLayout) {
     g_currentLayout = pipeline->layout;
@@ -811,6 +863,9 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
   g_layOut.keysNs += decode::lap(mark);
 #endif
   for (size_t i = 0; i < g_keyedDraws.size(); ++i) {
+#ifdef AURORA_DIAGNOSTICS
+    PlaceTimer timer;
+#endif
     decode::KeyedDraw& keyed = g_keyedDraws[i];
     PassDraw& draw = g_passDraws[g_keyedPlaces[i]];
     // A draw with no key has no vertex bytes' hash to find its list by, and is decoded whole each frame.
@@ -827,6 +882,9 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
     } else {
       place = g_cache.place(g_drawKeys[i], stream_bytes(keyed));
     }
+#ifdef AURORA_DIAGNOSTICS
+    timer.missed = !place || !place->decoded;
+#endif
     if (!place) {
       ++state.verticesSkipped;
       continue;
@@ -881,24 +939,27 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
   const VkDeviceSize offset = draw.offset;
   const VkDescriptorSet textures = frame_texture_set(data.bindGroups.textureBindGroup);
   if (textures != g_boundTextures) {
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 1, 1, &textures, 0, nullptr);
+    record_call<vkCmdBindDescriptorSets>("bind sets", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 1u, 1u,
+                                         &textures, 0u, nullptr);
     g_boundTextures = textures;
   }
   if (pipeline.fogRange && draw.fogRange != g_boundFogRange) {
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, glsl::FogRangeSet, 1, &draw.fogRange,
-                            0, nullptr);
+    record_call<vkCmdBindDescriptorSets>("bind sets", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout,
+                                         glsl::FogRangeSet, 1u, &draw.fogRange, 0u, nullptr);
     g_boundFogRange = draw.fogRange;
   }
   if (g_boundUniforms != data.uniformOffsets) {
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0, 1, &state.uniformSet,
-                            data.uniformOffsets.size(), data.uniformOffsets.data());
+    record_call<vkCmdBindDescriptorSets>("bind sets", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0u, 1u,
+                                         &state.uniformSet, static_cast<uint32_t>(data.uniformOffsets.size()),
+                                         data.uniformOffsets.data());
     g_boundUniforms = data.uniformOffsets;
   }
   // The current matrix of the position matrices piece, 48 bytes each, from the CPU's copy of the uniform data.
   const uint8_t* matrix = state.uniformData.get() + data.uniformOffsets[gx::UniformPosMtx] +
                           size_t{data.immediateData.currentPnMtx} * sizeof(Mat3x4<float>);
   if (g_pushedMatrix != matrix) {
-    vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Mat3x4<float>), matrix);
+    record_call<vkCmdPushConstants>("push constants", cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT, 0u,
+                                    static_cast<uint32_t>(sizeof(Mat3x4<float>)), matrix);
     g_pushedMatrix = matrix;
   }
   // A lit program's current normal matrix, after it: the normal matrices piece is there for every lit draw.
@@ -906,8 +967,9 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
     const uint8_t* normal = state.uniformData.get() + data.uniformOffsets[gx::UniformNrmMtx] +
                             size_t{data.immediateData.currentPnMtx} * sizeof(Mat3x4<float>);
     if (g_pushedNormalMatrix != normal) {
-      vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof(Mat3x4<float>), sizeof(Mat3x4<float>),
-                         normal);
+      record_call<vkCmdPushConstants>("push constants", cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT,
+                                      static_cast<uint32_t>(sizeof(Mat3x4<float>)),
+                                      static_cast<uint32_t>(sizeof(Mat3x4<float>)), normal);
       g_pushedNormalMatrix = normal;
     }
   }
@@ -923,29 +985,31 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
       for (size_t i = 0; i < moved.size(); ++i) {
         moved[i] = (mask >> i & 1) != 0 ? 1.f : 0.f;
       }
-      vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT, glsl::LineMaskOffset, glsl::LineMaskBytes,
-                         moved.data());
+      record_call<vkCmdPushConstants>("push constants", cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT,
+                                      glsl::LineMaskOffset, glsl::LineMaskBytes, moved.data());
       g_pushedLineMask = mask;
     }
   }
   if (g_boundVertices != offset) {
-    vkCmdBindVertexBuffers(cmd, 0, 1, &g_vertexCache.buffer, &offset);
+    record_call<vkCmdBindVertexBuffers>("bind vertex buffers", cmd, 0u, 1u, &g_vertexCache.buffer, &offset);
     g_boundVertices = offset;
   }
   if (!pipeline.vertexLayout.corners.empty()) {
     // Two triangles a segment or point, whatever indices the draw came with.
-    vkCmdDraw(cmd, glsl::stream_vertices(pipeline.shaderConfig, data.vtxCount), 1, 0, 0);
+    record_call<vkCmdDraw>("draw", cmd, glsl::stream_vertices(pipeline.shaderConfig, data.vtxCount), 1u, 0u, 0u);
   } else if (draw.indices != NoIndices) {
     // Each vertex names its first equal vertex, decoded once: the same triangles, and the GPU transforms each distinct
     // vertex once.
-    vkCmdBindIndexBuffer(cmd, g_vertexCache.buffer, draw.indices, VK_INDEX_TYPE_UINT16);
-    vkCmdDrawIndexed(cmd, data.vtxCount, 1, 0, 0, 0);
+    record_call<vkCmdBindIndexBuffer>("bind index buffer", cmd, g_vertexCache.buffer, draw.indices,
+                                      VK_INDEX_TYPE_UINT16);
+    record_call<vkCmdDrawIndexed>("draw indexed", cmd, data.vtxCount, 1u, 0u, 0, 0u);
   } else if (data.indexCount != 0) {
     const VkBuffer indices = data.patternIndices ? g_indexPatterns.buffer : state.indices.buffer;
-    vkCmdBindIndexBuffer(cmd, indices, data.idxRange.offset, VK_INDEX_TYPE_UINT16);
-    vkCmdDrawIndexed(cmd, data.indexCount, 1, 0, 0, 0);
+    record_call<vkCmdBindIndexBuffer>("bind index buffer", cmd, indices, VkDeviceSize{data.idxRange.offset},
+                                      VK_INDEX_TYPE_UINT16);
+    record_call<vkCmdDrawIndexed>("draw indexed", cmd, data.indexCount, 1u, 0u, 0, 0u);
   } else {
-    vkCmdDraw(cmd, data.vtxCount, 1, 0, 0);
+    record_call<vkCmdDraw>("draw", cmd, data.vtxCount, 1u, 0u, 0u);
   }
 }
 
@@ -954,18 +1018,18 @@ void draw_clear(const clear::DrawData& data, const TextureExtent& size, VkComman
   if (!bind_pipeline(data.pipeline, cmd)) {
     return;
   }
-  vkCmdPushConstants(cmd, g_currentPipelineObject->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(data.color),
-                     data.color.data());
+  record_call<vkCmdPushConstants>("push constants", cmd, g_currentPipelineObject->layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                  0u, static_cast<uint32_t>(sizeof(data.color)), data.color.data());
   const VkViewport viewport{0.f,        0.f,       static_cast<float>(size.width), static_cast<float>(size.height),
                             data.depth, data.depth};
-  vkCmdSetViewport(cmd, 0, 1, &viewport);
+  record_call<vkCmdSetViewport>("set viewport", cmd, 0u, 1u, &viewport);
   const auto scissor = to_scissor(data.rect, size);
-  vkCmdSetScissor(cmd, 0, 1, &scissor);
+  record_call<vkCmdSetScissor>("set scissor", cmd, 0u, 1u, &scissor);
   const VkBuffer vertices = triangle_buffer();
   const VkDeviceSize offset = 0;
-  vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &offset);
+  record_call<vkCmdBindVertexBuffers>("bind vertex buffers", cmd, 0u, 1u, &vertices, &offset);
   g_boundVertices.reset();
-  vkCmdDraw(cmd, 3, 1, 0, 0);
+  record_call<vkCmdDraw>("draw", cmd, 3u, 1u, 0u, 0u);
 }
 
 // Render worker: the slot a snapshot of the frame's last pass goes into, its texture at the GX framebuffer's size; null
@@ -1205,19 +1269,19 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
 #ifdef AURORA_DIAGNOSTICS
     const auto recordStart = std::chrono::steady_clock::now();
 #endif
-    vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    record_call<vkCmdBeginRenderPass>("begin render pass", cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
     reset_bindings();
     size_t gxDraws = 0;
     for (auto& command : pass.commands) {
       switch (command.type) {
       case detail::CommandType::SetViewport: {
         const auto viewport = to_viewport(command.data.setViewport);
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        record_call<vkCmdSetViewport>("set viewport", cmd, 0u, 1u, &viewport);
         break;
       }
       case detail::CommandType::SetScissor: {
         const auto scissor = to_scissor(command.data.setScissor, colorAttachment.size);
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        record_call<vkCmdSetScissor>("set scissor", cmd, 0u, 1u, &scissor);
         break;
       }
       case detail::CommandType::Draw:
@@ -1239,7 +1303,7 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
         break;
       }
     }
-    vkCmdEndRenderPass(cmd);
+    record_call<vkCmdEndRenderPass>("end render pass", cmd);
 #ifdef AURORA_DIAGNOSTICS
     g_gxDraws += g_passDraws.size();
     g_layOutNs += std::chrono::duration_cast<std::chrono::nanoseconds>(recordStart - layOutStart).count();
@@ -1512,6 +1576,46 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
         keys.arrays, keys.hashNs / draws, keys.ranges, keys.hashedBytes / 1024, keys.keyNs / draws,
         layOut.placeNs / draws, layOut.decodeNs / draws, layOut.decodedDraws, layOut.decodedVertices, helper.passes,
         helper.waitNs / 1e3, layOut.forgetNs / draws, clock_read_ns());
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t nowTicks = decode::ticks();
+    const double nsPerTick = std::chrono::duration<double, std::nano>(now - g_windowStart).count() /
+                             static_cast<double>(std::max<uint64_t>(nowTicks - g_windowTicks, 1));
+    g_windowStart = now;
+    g_windowTicks = nowTicks;
+    const auto each = [&](uint64_t ticks, uint64_t count) {
+      return static_cast<double>(ticks) * nsPerTick / static_cast<double>(std::max<uint64_t>(count, 1));
+    };
+    Log.info(
+        "Laying out, last 1000 frames: placing {} draws that found their vertices at {:.0f} ns each and {} that "
+        "didn't at {:.0f}; work shared with the helper {} times, which started {:.0f} us after on average, did "
+        "{:.1f}% of the shared decodes' vertices, and was withdrawn {} times",
+        layOut.hits, each(layOut.hitTicks, layOut.hits), layOut.misses, each(layOut.missTicks, layOut.misses),
+        helper.shared, helper.startNs / 1e3 / static_cast<double>(std::max<uint64_t>(helper.shared, 1)),
+        100.0 * static_cast<double>(helper.helperVertices) /
+            static_cast<double>(std::max<uint64_t>(helper.vertices, 1)),
+        helper.withdrawn);
+    // The calls by function: one entry each for the argument types a function is called with.
+    std::vector<VulkanCalls> byName;
+    uint64_t vulkanTicks = 0;
+    for (VulkanCalls* calls : g_vulkanCalls) {
+      const auto it =
+          std::ranges::find_if(byName, [&](const auto& c) { return std::strcmp(c.name, calls->name) == 0; });
+      auto& sum = it != byName.end() ? *it : byName.emplace_back(VulkanCalls{calls->name});
+      sum.calls += calls->calls;
+      sum.ticks += calls->ticks;
+      vulkanTicks += calls->ticks;
+      *calls = VulkanCalls{calls->name};
+    }
+    std::string perCall;
+    for (const auto& calls : byName) {
+      fmt::format_to(std::back_inserter(perCall), "{}{} {:.2f} at {:.0f} ns", perCall.empty() ? "" : ", ", calls.name,
+                     static_cast<double>(calls.calls) / draws, each(calls.ticks, calls.calls));
+    }
+    const double vulkanNs = static_cast<double>(vulkanTicks) * nsPerTick / draws;
+    Log.info(
+        "Recording, last 1000 frames: a GX draw's {:.0f} ns, {:.0f} of it in vulkan4xenon's calls and {:.0f} in "
+        "Aurora's own; calls a draw: {}; a time base read takes {:.0f} ns",
+        g_recordNs / draws, vulkanNs, g_recordNs / draws - vulkanNs, perCall, tick_read_ticks() * nsPerTick);
     g_gxDraws = 0;
     g_layOutNs = 0;
     g_recordNs = 0;

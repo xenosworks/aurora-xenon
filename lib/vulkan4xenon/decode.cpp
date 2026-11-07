@@ -769,6 +769,11 @@ public:
     return m_taken;
   }
 
+#ifdef AURORA_DIAGNOSTICS
+  // When the helper started on the work end waited for.
+  std::chrono::steady_clock::time_point started_at() const noexcept { return m_startedAt; }
+#endif
+
 private:
   void run() noexcept {
     aurora::thread::set_current({.name = "Aurora decode helper"});
@@ -777,6 +782,9 @@ private:
       if (m_work.take == nullptr) {
         return;
       }
+#ifdef AURORA_DIAGNOSTICS
+      m_startedAt = std::chrono::steady_clock::now();
+#endif
       m_taken = m_work.take(m_work.work);
       m_done.post();
     }
@@ -786,6 +794,9 @@ private:
   Event m_done;
   SharedWork m_work;
   uint64_t m_taken = 0;
+#ifdef AURORA_DIAGNOSTICS
+  std::chrono::steady_clock::time_point m_startedAt;
+#endif
   std::thread m_thread;
 };
 
@@ -803,12 +814,18 @@ uint64_t run_shared(SharedWork work, bool share) noexcept {
     work.take(work.work);
     return 0;
   }
+#ifdef AURORA_DIAGNOSTICS
+  const auto posted = std::chrono::steady_clock::now();
+#endif
   helper().begin(work);
   work.take(work.work);
 #ifdef AURORA_DIAGNOSTICS
   auto mark = std::chrono::steady_clock::now();
   const uint64_t taken = helper().end();
   g_stats.waitNs += lap(mark);
+  ++g_stats.shared;
+  g_stats.startNs += static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(helper().started_at() - posted).count());
   return taken;
 #else
   return helper().end();
