@@ -118,6 +118,9 @@ PipelineRef g_currentPipeline = UINTPTR_MAX;
 const backend::Pipeline* g_currentPipelineObject = nullptr;
 VkPipelineLayout g_currentLayout = VK_NULL_HANDLE;
 VkDescriptorSet g_boundTextures = VK_NULL_HANDLE;
+// The uniform set's dynamic offsets last bound, and the vertex cache's offset: consecutive draws often share them.
+std::optional<std::array<uint32_t, gx::UniformPieceCount>> g_boundUniforms;
+std::optional<VkDeviceSize> g_boundVertices;
 // The position and normal matrices last pushed, by their places in the frame's uniform data, and a line or point
 // draw's texture coordinate mask (glsl.hpp), NoLineMask for none.
 const uint8_t* g_pushedMatrix = nullptr;
@@ -500,6 +503,7 @@ void use_pipeline(PipelineRef ref, const backend::Pipeline* pipeline, VkCommandB
     g_currentLayout = pipeline->layout;
     g_boundTextures = VK_NULL_HANDLE;
     g_boundFogRange = VK_NULL_HANDLE;
+    g_boundUniforms.reset();
     g_pushedMatrix = nullptr;
     g_pushedNormalMatrix = nullptr;
     g_pushedLineMask = NoLineMask;
@@ -525,6 +529,8 @@ void reset_bindings() noexcept {
   g_currentPipelineObject = nullptr;
   g_currentLayout = VK_NULL_HANDLE;
   g_boundTextures = VK_NULL_HANDLE;
+  g_boundUniforms.reset();
+  g_boundVertices.reset();
   g_boundFogRange = VK_NULL_HANDLE;
   g_pushedMatrix = nullptr;
   g_pushedNormalMatrix = nullptr;
@@ -794,8 +800,11 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
                             0, nullptr);
     g_boundFogRange = draw.fogRange;
   }
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0, 1, &state.uniformSet,
-                          data.uniformOffsets.size(), data.uniformOffsets.data());
+  if (g_boundUniforms != data.uniformOffsets) {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0, 1, &state.uniformSet,
+                            data.uniformOffsets.size(), data.uniformOffsets.data());
+    g_boundUniforms = data.uniformOffsets;
+  }
   // The current matrix of the position matrices piece, 48 bytes each, from the CPU's copy of the uniform data.
   const uint8_t* matrix = state.uniformData.get() + data.uniformOffsets[gx::UniformPosMtx] +
                           size_t{data.immediateData.currentPnMtx} * sizeof(Mat3x4<float>);
@@ -830,7 +839,10 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
       g_pushedLineMask = mask;
     }
   }
-  vkCmdBindVertexBuffers(cmd, 0, 1, &g_vertexCache.buffer, &offset);
+  if (g_boundVertices != offset) {
+    vkCmdBindVertexBuffers(cmd, 0, 1, &g_vertexCache.buffer, &offset);
+    g_boundVertices = offset;
+  }
   if (!pipeline.vertexLayout.corners.empty()) {
     // Two triangles a segment or point, whatever indices the draw came with.
     vkCmdDraw(cmd, glsl::stream_vertices(pipeline.shaderConfig, data.vtxCount), 1, 0, 0);
@@ -863,6 +875,7 @@ void draw_clear(const clear::DrawData& data, const TextureExtent& size, VkComman
   const VkBuffer vertices = triangle_buffer();
   const VkDeviceSize offset = 0;
   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &offset);
+  g_boundVertices.reset();
   vkCmdDraw(cmd, 3, 1, 0, 0);
 }
 
