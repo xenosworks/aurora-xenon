@@ -5,6 +5,7 @@
 #include "../gx/pipeline.hpp"
 #include "glsl.hpp"
 
+#include <absl/base/prefetch.h>
 #include <absl/container/flat_hash_map.h>
 
 #include <array>
@@ -279,7 +280,8 @@ public:
   // entries split into runs shorter than the draw.
   struct Place {
     uint64_t offset;
-    bool decoded; // it holds the draw's vertices already
+    bool decoded;   // it holds the draw's vertices already
+    uint32_t entry; // its entry, for prefetch_entry
   };
   std::optional<Place> place(const std::optional<DecodeKey>& key, uint64_t size);
 
@@ -288,6 +290,13 @@ public:
 
   // Starts loading where place or find will look the key up, so a few draws' lookups miss the CPU's caches at once.
   void prefetch(const DecodeKey& key) const noexcept { m_byKey.prefetch(key); }
+  // The same for an entry a draw is likely to use, as a Place gave it: in a frame like the last, the draw in the same
+  // place. Any number will do; one that names no entry loads nothing.
+  void prefetch_entry(uint32_t entry) const noexcept {
+    if (entry < m_entries.size()) {
+      absl::PrefetchToLocalCache(&m_entries[entry]);
+    }
+  }
 
   // A key whose decode read outside what the key covers: its entry stays until its space is taken, but no draw finds
   // it again.

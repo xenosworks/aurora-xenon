@@ -1097,7 +1097,7 @@ std::optional<VertexCache::Place> VertexCache::place(const std::optional<DecodeK
   m_stats.missBytes += size;
   m_used += rounded;
   m_stats.peakUsedBytes = std::max(m_stats.peakUsedBytes, m_used);
-  return Place{*offset, false};
+  return Place{*offset, false, index};
 }
 
 void VertexCache::forget(const DecodeKey& key) noexcept {
@@ -1116,7 +1116,7 @@ VertexCache::Place VertexCache::use(uint32_t index, uint64_t size) noexcept {
   touch(index);
   ++m_stats.hits;
   m_stats.hitBytes += size;
-  return Place{m_entries[index].offset, true};
+  return Place{m_entries[index].offset, true, index};
 }
 
 // Used by this frame: it becomes the newest, so the list runs from this frame's entries back to the oldest's.

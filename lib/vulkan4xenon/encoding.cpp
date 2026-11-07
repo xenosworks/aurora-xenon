@@ -13,6 +13,7 @@
 #include "tiled_index.hpp"
 #include "ui_layout.hpp"
 
+#include <absl/base/prefetch.h>
 #include <xxhash.h>
 
 #include <algorithm>
@@ -165,6 +166,12 @@ struct PassDraw {
   VkDescriptorSet fogRange = VK_NULL_HANDLE;   // a range-fog program's table
 };
 std::vector<PassDraw> g_passDraws;
+// Render worker: the vertex cache entry each keyed draw used, by its place among its frame's keyed draws, which a frame
+// like the last takes in the same order; and the frame's keyed draws so far.
+std::vector<uint32_t> g_drawEntries;
+size_t g_frameKeyedDraws = 0;
+// How far ahead lay_out_pass fetches the pass's commands.
+constexpr size_t CommandsAhead = 4;
 // The pass's draws with a pipeline, their place in g_passDraws, keys and arrays' ends; and those to decode.
 std::vector<decode::KeyedDraw> g_keyedDraws;
 std::vector<size_t> g_keyedPlaces;
@@ -851,7 +858,15 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
   const uint32_t targetWidth = pass.colorAttachments[SceneColorAttachmentIndex].size.width;
   PipelineRef ref = UINTPTR_MAX;
   const backend::Pipeline* pipeline = nullptr;
-  for (auto& command : pass.commands) {
+  for (size_t c = 0; c < pass.commands.size(); ++c) {
+    // Here the pass's commands are first read on this core, two lines each that the FIFO worker wrote on another, so
+    // each is fetched a few commands ahead and their misses overlap.
+    if (c + CommandsAhead < pass.commands.size()) {
+      const auto* ahead = reinterpret_cast<const char*>(&pass.commands[c + CommandsAhead]);
+      absl::PrefetchToLocalCache(ahead);
+      absl::PrefetchToLocalCache(ahead + sizeof(detail::Command) - 1);
+    }
+    auto& command = pass.commands[c];
     if (command.type != detail::CommandType::Draw || command.data.draw.kind != detail::DrawKind::Gx) {
       continue;
     }
@@ -888,11 +903,20 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
 #ifdef AURORA_DIAGNOSTICS
   g_layOut.keysNs += decode::lap(mark);
 #endif
-  // The cache's lookups mostly miss the CPU's caches, so each is started a few draws ahead and they overlap.
+  // The cache's lookups mostly miss the CPU's caches, so each is started a few draws ahead and they overlap, with the
+  // entry the draw in the same place used last frame.
   constexpr size_t LookAhead = 4;
-  const auto prefetch = [](size_t i) {
-    if (i < g_drawKeys.size() && g_drawKeys[i]) {
-      g_cache.prefetch(*g_drawKeys[i]);
+  const size_t first = g_frameKeyedDraws;
+  g_frameKeyedDraws += g_keyedDraws.size();
+  if (g_drawEntries.size() < g_frameKeyedDraws) {
+    g_drawEntries.resize(g_frameKeyedDraws, UINT32_MAX);
+  }
+  const auto prefetch = [first](size_t i) {
+    if (i < g_drawKeys.size()) {
+      g_cache.prefetch_entry(g_drawEntries[first + i]);
+      if (g_drawKeys[i]) {
+        g_cache.prefetch(*g_drawKeys[i]);
+      }
     }
   };
   for (size_t i = 0; i < LookAhead; ++i) {
@@ -922,6 +946,7 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
 #ifdef AURORA_DIAGNOSTICS
     timer.missed = !place || !place->decoded;
 #endif
+    g_drawEntries[first + i] = place ? place->entry : UINT32_MAX;
     if (!place) {
       ++state.verticesSkipped;
       continue;
@@ -1525,6 +1550,7 @@ void start_frame(detail::FramePacket& frame) noexcept {
 #ifdef AURORA_DIAGNOSTICS
     g_timedFrame = ++g_frameNumber % TimedFrameInterval == 0;
 #endif
+    g_frameKeyedDraws = 0;
     // Every frame before this one has been submitted: its end item came first.
     g_cache.begin_frame(next_frame_serial());
     g_keys.begin_frame();
