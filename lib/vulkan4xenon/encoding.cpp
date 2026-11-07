@@ -164,6 +164,7 @@ std::vector<std::pair<uint32_t, VkDescriptorSet>> g_passFogRanges;
 constexpr VkDeviceSize NoIndices = UINT64_MAX;
 // Render worker: the pass being recorded's GX draws, in order, as lay_out_pass placed them.
 struct PassDraw {
+  const gx::DrawData* data = nullptr;
   const backend::Pipeline* pipeline = nullptr; // none for a draw that records nothing (gfx::get_main_pipeline)
   VkDeviceSize offset = 0;                     // its vertices, in the vertex cache
   VkDeviceSize indices = NoIndices;            // a listed draw's index list, in the vertex cache
@@ -175,8 +176,9 @@ std::vector<PassDraw> g_passDraws;
 // like the last takes in the same order; and the frame's keyed draws so far.
 std::vector<uint32_t> g_drawEntries;
 size_t g_frameKeyedDraws = 0;
-// How far ahead lay_out_pass fetches the pass's commands.
+// How far ahead lay_out_pass fetches the pass's commands, and recording the matrices a draw pushes.
 constexpr size_t CommandsAhead = 4;
+constexpr size_t MatricesAhead = 3;
 // The pass's draws with a pipeline, their place in g_passDraws, keys and arrays' ends; and those to decode.
 std::vector<decode::KeyedDraw> g_keyedDraws;
 std::vector<size_t> g_keyedPlaces;
@@ -877,6 +879,7 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
     }
     const auto& data = detail::inline_payload<gx::DrawData>(command.data.draw.payload.data());
     PassDraw& draw = g_passDraws.emplace_back();
+    draw.data = &data;
     if (data.vtxCount == 0) {
       continue;
     }
@@ -1015,6 +1018,24 @@ bool push_changes(PushedMatrix& pushed, const uint8_t* at) noexcept {
     std::memcpy(pushed.values.data(), at, pushed.values.size());
   }
   return !same;
+}
+
+// The matrices the draw at index pushes, in the frame's uniform data, which this core hasn't read: fetched a few draws
+// ahead, the push doesn't wait for them.
+void prefetch_matrices(const FrameState& state, size_t index) noexcept {
+  if (index >= g_passDraws.size() || g_passDraws[index].pipeline == nullptr || !g_passDraws[index].decoded) {
+    return;
+  }
+  const PassDraw& draw = g_passDraws[index];
+  const size_t row = size_t{draw.data->immediateData.currentPnMtx} * sizeof(Mat3x4<float>);
+  const uint8_t* matrix = state.uniformData.get() + draw.data->uniformOffsets[gx::UniformPosMtx] + row;
+  absl::PrefetchToLocalCache(matrix);
+  absl::PrefetchToLocalCache(matrix + sizeof(Mat3x4<float>) - 1);
+  if (draw.pipeline->normalMatrix) {
+    const uint8_t* normal = state.uniformData.get() + draw.data->uniformOffsets[gx::UniformNrmMtx] + row;
+    absl::PrefetchToLocalCache(normal);
+    absl::PrefetchToLocalCache(normal + sizeof(Mat3x4<float>) - 1);
+  }
 }
 
 // count 16-bit indices from offset bytes into buffer. The offset goes in as the draw's first index, which the layer
@@ -1388,6 +1409,7 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
       case detail::CommandType::Draw:
         switch (command.data.draw.kind) {
         case detail::DrawKind::Gx:
+          prefetch_matrices(state, gxDraws + MatricesAhead);
           draw_gx(state, detail::inline_payload<gx::DrawData>(command.data.draw.payload.data()), g_passDraws[gxDraws++],
                   cmd);
           break;
