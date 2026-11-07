@@ -132,6 +132,10 @@ uint32_t g_pushedLineMask = NoLineMask;
 std::optional<BindGroupRef> g_lookedUpRef;
 VkDescriptorSet g_lookedUpSet = VK_NULL_HANDLE;
 VkDescriptorSet g_boundFogRange = VK_NULL_HANDLE;
+// Render worker: pipelines found, at their ref's low bits, without get_main_pipeline's lock and lookup. The cache
+// keeps each until it shuts down, after the render worker (gfx/frame.cpp, shutdown).
+constexpr size_t PipelineMemoSize = 256;
+std::array<std::pair<PipelineRef, const backend::Pipeline*>, PipelineMemoSize> g_pipelineMemo{};
 
 // Render worker: the range fog tables (glsl.hpp), the most recently used last. The FIFO worker pushes Aurora's table
 // into the frame's storage pool when a draw's fog changes it (gx/command_processor.cpp, push_gx_draw), so a frame has
@@ -522,6 +526,20 @@ void upload_textures(FrameState& state, const detail::FrameOp& op, VkCommandBuff
   state.uploadsDone = op.textureUploads.size();
 }
 
+// get_main_pipeline's pipeline, null until it exists.
+const backend::Pipeline* main_pipeline(PipelineRef ref) noexcept {
+  auto& [memoRef, memoPipeline] = g_pipelineMemo[ref % PipelineMemoSize];
+  if (memoPipeline != nullptr && memoRef == ref) {
+    return memoPipeline;
+  }
+  const backend::Pipeline* pipeline = get_main_pipeline(ref);
+  if (pipeline != nullptr) {
+    memoRef = ref;
+    memoPipeline = pipeline;
+  }
+  return pipeline;
+}
+
 // A pipeline from get_main_pipeline: create_pipeline makes no prepass.
 void use_pipeline(PipelineRef ref, const backend::Pipeline* pipeline, VkCommandBuffer cmd) noexcept {
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
@@ -543,7 +561,7 @@ bool bind_pipeline(PipelineRef ref, VkCommandBuffer cmd) noexcept {
   if (ref == g_currentPipeline) {
     return true;
   }
-  const auto* pipeline = get_main_pipeline(ref);
+  const auto* pipeline = main_pipeline(ref);
   if (!pipeline) {
     return false;
   }
@@ -655,12 +673,12 @@ VkDescriptorSet pass_fog_range(std::span<const uint8_t> storage, uint32_t base, 
 const backend::Pipeline* look_up_pipeline(PipelineRef ref) noexcept {
 #ifdef AURORA_DIAGNOSTICS
   auto mark = std::chrono::steady_clock::now();
-  const backend::Pipeline* pipeline = get_main_pipeline(ref);
+  const backend::Pipeline* pipeline = main_pipeline(ref);
   g_layOut.lookupNs += decode::lap(mark);
   ++g_layOut.lookups;
   return pipeline;
 #else
-  return get_main_pipeline(ref);
+  return main_pipeline(ref);
 #endif
 }
 
@@ -1316,6 +1334,7 @@ void shutdown_frames() noexcept {
   g_passFogRanges.clear();
   reset_bindings();
   g_passDraws.clear();
+  g_pipelineMemo = {};
   std::lock_guard lock{g_depthPeekMutex};
   g_depthPeekSlots = {};
   g_depthPeekRequested = false;
