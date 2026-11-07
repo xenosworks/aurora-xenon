@@ -1229,4 +1229,10 @@ bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {
   return true;
 }
 
+const backend::Pipeline* get_main_pipeline(PipelineRef ref) {
+  std::lock_guard guard{g_pipelineMutex};
+  const auto it = g_pipelines.find(ref);
+  return it == g_pipelines.end() ? nullptr : it->second.main.get();
+}
+
 } // namespace aurora::gfx

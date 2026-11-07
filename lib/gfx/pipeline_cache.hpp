@@ -35,6 +35,9 @@ PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
 
 // False until the pipeline exists.
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
+// The main pipeline alone, or null until it exists, with no shared_ptr copy's atomic counts: the cache keeps every
+// pipeline until it shuts down, after the render worker (frame.cpp, shutdown).
+const backend::Pipeline* get_main_pipeline(PipelineRef ref);
 void get_pipeline_counts(uint32_t& queued, uint32_t& created);
 
 } // namespace aurora::gfx

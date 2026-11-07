@@ -115,7 +115,7 @@ std::shared_ptr<backend::Texture> g_efbDepthRead;
 
 // Render worker: what the pass being recorded has bound.
 PipelineRef g_currentPipeline = UINTPTR_MAX;
-std::shared_ptr<backend::Pipeline> g_currentPipelineObject;
+const backend::Pipeline* g_currentPipelineObject = nullptr;
 VkPipelineLayout g_currentLayout = VK_NULL_HANDLE;
 VkDescriptorSet g_boundTextures = VK_NULL_HANDLE;
 // The position and normal matrices last pushed, by their places in the frame's uniform data, and a line or point
@@ -148,7 +148,7 @@ std::vector<std::pair<uint32_t, VkDescriptorSet>> g_passFogRanges;
 constexpr VkDeviceSize NoIndices = UINT64_MAX;
 // Render worker: the pass being recorded's GX draws, in order, as lay_out_pass placed them.
 struct PassDraw {
-  std::shared_ptr<backend::Pipeline> pipeline; // none for a draw that records nothing
+  const backend::Pipeline* pipeline = nullptr; // none for a draw that records nothing (gfx::get_main_pipeline)
   VkDeviceSize offset = 0;                     // its vertices, in the vertex cache
   VkDeviceSize indices = NoIndices;            // a listed draw's index list, in the vertex cache
   bool decoded = false;                        // false when the cache had no room: its pipeline is bound, no more
@@ -492,17 +492,8 @@ void upload_textures(FrameState& state, const detail::FrameOp& op, VkCommandBuff
   state.uploadsDone = op.textureUploads.size();
 }
 
-// A pipeline that exists, so usable now; null while it is still being built, or when it couldn't be. create_pipeline
-// makes no prepass.
-std::shared_ptr<backend::Pipeline> usable_pipeline(PipelineRef ref) noexcept {
-  CompiledPipeline pipeline;
-  if (!get_pipeline(ref, pipeline)) {
-    return nullptr;
-  }
-  return std::move(pipeline.main);
-}
-
-void use_pipeline(PipelineRef ref, std::shared_ptr<backend::Pipeline> pipeline, VkCommandBuffer cmd) noexcept {
+// A pipeline from get_main_pipeline: create_pipeline makes no prepass.
+void use_pipeline(PipelineRef ref, const backend::Pipeline* pipeline, VkCommandBuffer cmd) noexcept {
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
   // Another layout leaves the GX sets and push constants undefined.
   if (pipeline->layout != g_currentLayout) {
@@ -514,24 +505,24 @@ void use_pipeline(PipelineRef ref, std::shared_ptr<backend::Pipeline> pipeline, 
     g_pushedLineMask = NoLineMask;
   }
   g_currentPipeline = ref;
-  g_currentPipelineObject = std::move(pipeline);
+  g_currentPipelineObject = pipeline;
 }
 
 bool bind_pipeline(PipelineRef ref, VkCommandBuffer cmd) noexcept {
   if (ref == g_currentPipeline) {
     return true;
   }
-  auto pipeline = usable_pipeline(ref);
+  const auto* pipeline = get_main_pipeline(ref);
   if (!pipeline) {
     return false;
   }
-  use_pipeline(ref, std::move(pipeline), cmd);
+  use_pipeline(ref, pipeline, cmd);
   return true;
 }
 
 void reset_bindings() noexcept {
   g_currentPipeline = UINTPTR_MAX;
-  g_currentPipelineObject.reset();
+  g_currentPipelineObject = nullptr;
   g_currentLayout = VK_NULL_HANDLE;
   g_boundTextures = VK_NULL_HANDLE;
   g_boundFogRange = VK_NULL_HANDLE;
@@ -705,7 +696,7 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
   // Aurora's range fog table has a factor for each column of the pass's target (gx/command_processor.cpp).
   const uint32_t targetWidth = pass.colorAttachments[SceneColorAttachmentIndex].size.width;
   PipelineRef ref = UINTPTR_MAX;
-  std::shared_ptr<backend::Pipeline> pipeline;
+  const backend::Pipeline* pipeline = nullptr;
   for (auto& command : pass.commands) {
     if (command.type != detail::CommandType::Draw || command.data.draw.kind != detail::DrawKind::Gx) {
       continue;
@@ -717,7 +708,7 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
     }
     if (data.pipeline != ref) {
       ref = data.pipeline;
-      pipeline = usable_pipeline(ref);
+      pipeline = get_main_pipeline(ref);
     }
     if (!pipeline) {
       continue;
