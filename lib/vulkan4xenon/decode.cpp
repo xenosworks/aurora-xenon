@@ -731,18 +731,9 @@ uint64_t hash_taken(void* work) noexcept {
   return bytes;
 }
 
-// A wake-up between the two threads. The semaphore orders each thread's memory before the other's.
-class Event {
-public:
-  bool valid() const noexcept { return true; }
-  void post() noexcept { m_sema.release(); }
-  void wait() noexcept { m_sema.acquire(); }
-
-private:
-  std::binary_semaphore m_sema{0};
-};
-
-// The helper thread: woken with shared work, it takes items until none are left, then says so.
+// The helper thread: woken with shared work, it takes items until none are left, then says so. Work it hasn't started
+// when the caller has taken every item is withdrawn, so the caller doesn't wait for the helper to wake to find none
+// left. The semaphores order each thread's memory before the other's.
 class Helper {
 public:
   Helper() noexcept : m_thread([this] { run(); }) {}
@@ -751,8 +742,8 @@ public:
     if (!running()) {
       return;
     }
-    m_work = {};
-    m_start.post();
+    m_stop.store(true, std::memory_order_relaxed);
+    m_start.release();
     m_thread.join();
   }
 
@@ -760,12 +751,18 @@ public:
 
   void begin(SharedWork work) noexcept {
     m_work = work;
-    m_start.post();
+    m_state.store(Posted, std::memory_order_release);
+    m_start.release();
   }
 
-  // Waits for the helper to finish its share, and returns what its take returned.
-  uint64_t end() noexcept {
-    m_done.wait();
+  // Once the caller has taken its share: what the helper's take returned, after waiting for it to finish; or none, the
+  // work withdrawn, when the helper hadn't started on it.
+  std::optional<uint64_t> end() noexcept {
+    uint32_t posted = Posted;
+    if (m_state.compare_exchange_strong(posted, Idle, std::memory_order_acq_rel)) {
+      return std::nullopt;
+    }
+    m_done.acquire();
     return m_taken;
   }
 
@@ -775,23 +772,34 @@ public:
 #endif
 
 private:
+  enum : uint32_t { Idle, Posted, Started };
+
   void run() noexcept {
     aurora::thread::set_current({.name = "Aurora decode helper"});
     while (true) {
-      m_start.wait();
-      if (m_work.take == nullptr) {
+      m_start.acquire();
+      if (m_stop.load(std::memory_order_relaxed)) {
         return;
+      }
+      // A withdrawn work's wake-up, or one for work an earlier wake-up took, finds none posted.
+      uint32_t posted = Posted;
+      if (!m_state.compare_exchange_strong(posted, Started, std::memory_order_acq_rel)) {
+        continue;
       }
 #ifdef AURORA_DIAGNOSTICS
       m_startedAt = std::chrono::steady_clock::now();
 #endif
       m_taken = m_work.take(m_work.work);
-      m_done.post();
+      m_state.store(Idle, std::memory_order_release);
+      m_done.release();
     }
   }
 
-  Event m_start;
-  Event m_done;
+  // Counting: a withdrawn work's wake-up is still pending when the next work is posted.
+  std::counting_semaphore<> m_start{0};
+  std::binary_semaphore m_done{0};
+  std::atomic<uint32_t> m_state{Idle};
+  std::atomic<bool> m_stop{false};
   SharedWork m_work;
   uint64_t m_taken = 0;
 #ifdef AURORA_DIAGNOSTICS
@@ -821,14 +829,18 @@ uint64_t run_shared(SharedWork work, bool share) noexcept {
   work.take(work.work);
 #ifdef AURORA_DIAGNOSTICS
   auto mark = std::chrono::steady_clock::now();
-  const uint64_t taken = helper().end();
+  const std::optional<uint64_t> taken = helper().end();
   g_stats.waitNs += lap(mark);
   ++g_stats.shared;
-  g_stats.startNs += static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(helper().started_at() - posted).count());
-  return taken;
+  if (!taken) {
+    ++g_stats.withdrawn;
+  } else {
+    g_stats.startNs += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(helper().started_at() - posted).count());
+  }
+  return taken.value_or(0);
 #else
-  return helper().end();
+  return helper().end().value_or(0);
 #endif
 }
 } // namespace

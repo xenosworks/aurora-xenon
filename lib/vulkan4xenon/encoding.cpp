@@ -1590,7 +1590,8 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
         "didn't at {:.0f}; work shared with the helper {} times, which started {:.0f} us after on average, did "
         "{:.1f}% of the shared decodes' vertices, and was withdrawn {} times",
         layOut.hits, each(layOut.hitTicks, layOut.hits), layOut.misses, each(layOut.missTicks, layOut.misses),
-        helper.shared, helper.startNs / 1e3 / static_cast<double>(std::max<uint64_t>(helper.shared, 1)),
+        helper.shared,
+        helper.startNs / 1e3 / static_cast<double>(std::max<uint64_t>(helper.shared - helper.withdrawn, 1)),
         100.0 * static_cast<double>(helper.helperVertices) /
             static_cast<double>(std::max<uint64_t>(helper.vertices, 1)),
         helper.withdrawn);
