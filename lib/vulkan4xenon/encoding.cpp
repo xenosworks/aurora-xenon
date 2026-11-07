@@ -125,10 +125,15 @@ std::optional<std::array<uint32_t, gx::UniformPieceCount>> g_boundUniforms;
 std::optional<VkDeviceSize> g_boundVertices;
 // The index buffer bound, at offset 0: draws give their offsets as their first index.
 VkBuffer g_boundIndices = VK_NULL_HANDLE;
-// The position and normal matrices last pushed, by their places in the frame's uniform data, and a line or point
-// draw's texture coordinate mask (glsl.hpp), NoLineMask for none.
-const uint8_t* g_pushedMatrix = nullptr;
-const uint8_t* g_pushedNormalMatrix = nullptr;
+// The position and normal matrices last pushed: their place in the frame's uniform data, null for none, and their
+// values, as draws often push the same matrix from another place. And a line or point draw's texture coordinate mask
+// (glsl.hpp), NoLineMask for none.
+struct PushedMatrix {
+  const uint8_t* at = nullptr;
+  std::array<uint8_t, sizeof(Mat3x4<float>)> values{};
+};
+PushedMatrix g_pushedMatrix;
+PushedMatrix g_pushedNormalMatrix;
 constexpr uint32_t NoLineMask = UINT32_MAX;
 uint32_t g_pushedLineMask = NoLineMask;
 // The texture sets looked up this frame, at their ref's low bits, without texture_set's lock and lookup. A ref's set
@@ -630,8 +635,8 @@ void use_pipeline(PipelineRef ref, const backend::Pipeline* pipeline, VkCommandB
     g_boundTextures = VK_NULL_HANDLE;
     g_boundFogRange = VK_NULL_HANDLE;
     g_boundUniforms.reset();
-    g_pushedMatrix = nullptr;
-    g_pushedNormalMatrix = nullptr;
+    g_pushedMatrix.at = nullptr;
+    g_pushedNormalMatrix.at = nullptr;
     g_pushedLineMask = NoLineMask;
   }
   g_currentPipeline = ref;
@@ -659,8 +664,8 @@ void reset_bindings() noexcept {
   g_boundVertices.reset();
   g_boundIndices = VK_NULL_HANDLE;
   g_boundFogRange = VK_NULL_HANDLE;
-  g_pushedMatrix = nullptr;
-  g_pushedNormalMatrix = nullptr;
+  g_pushedMatrix.at = nullptr;
+  g_pushedNormalMatrix.at = nullptr;
   g_pushedLineMask = NoLineMask;
 }
 
@@ -985,6 +990,33 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
 #endif
 }
 
+// Whether a uniform piece the pipeline reads is bound at another offset than the draw's, or none is bound. The pieces
+// it doesn't read are left where they are: its programs declare only those they read (glsl.cpp, uniform_blocks).
+bool uniforms_moved(const std::array<uint32_t, gx::UniformPieceCount>& offsets, uint32_t pieces) noexcept {
+  if (!g_boundUniforms) {
+    return true;
+  }
+  for (uint32_t i = 0; i < gx::UniformPieceCount; ++i) {
+    if ((pieces >> i & 1) != 0 && (*g_boundUniforms)[i] != offsets[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Whether the matrix at at holds other values than those pushed, which it then becomes.
+bool push_changes(PushedMatrix& pushed, const uint8_t* at) noexcept {
+  if (pushed.at == at) {
+    return false;
+  }
+  const bool same = pushed.at != nullptr && std::memcmp(pushed.values.data(), at, pushed.values.size()) == 0;
+  pushed.at = at;
+  if (!same) {
+    std::memcpy(pushed.values.data(), at, pushed.values.size());
+  }
+  return !same;
+}
+
 // count 16-bit indices from offset bytes into buffer. The offset goes in as the draw's first index, which the layer
 // adds to the bound buffer's address as it would the bind's offset (vulkan4xenon: src/queue.c, draw_indexed), so the
 // buffer is bound again only when it changes. Offsets are even: indices are pushed whole, patterns are whole arrays,
@@ -1023,7 +1055,7 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
                                          glsl::FogRangeSet, 1u, &draw.fogRange, 0u, nullptr);
     g_boundFogRange = draw.fogRange;
   }
-  if (g_boundUniforms != data.uniformOffsets) {
+  if (uniforms_moved(data.uniformOffsets, pipeline.uniformPieces)) {
     record_call<vkCmdBindDescriptorSets>("bind uniforms", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0u, 1u,
                                          &state.uniformSet, static_cast<uint32_t>(data.uniformOffsets.size()),
                                          data.uniformOffsets.data());
@@ -1032,20 +1064,18 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
   // The current matrix of the position matrices piece, 48 bytes each, from the CPU's copy of the uniform data.
   const uint8_t* matrix = state.uniformData.get() + data.uniformOffsets[gx::UniformPosMtx] +
                           size_t{data.immediateData.currentPnMtx} * sizeof(Mat3x4<float>);
-  if (g_pushedMatrix != matrix) {
+  if (push_changes(g_pushedMatrix, matrix)) {
     record_call<vkCmdPushConstants>("push constants", cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT, 0u,
                                     static_cast<uint32_t>(sizeof(Mat3x4<float>)), matrix);
-    g_pushedMatrix = matrix;
   }
   // A lit program's current normal matrix, after it: the normal matrices piece is there for every lit draw.
   if (pipeline.normalMatrix) {
     const uint8_t* normal = state.uniformData.get() + data.uniformOffsets[gx::UniformNrmMtx] +
                             size_t{data.immediateData.currentPnMtx} * sizeof(Mat3x4<float>);
-    if (g_pushedNormalMatrix != normal) {
+    if (push_changes(g_pushedNormalMatrix, normal)) {
       record_call<vkCmdPushConstants>("push constants", cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT,
                                       static_cast<uint32_t>(sizeof(Mat3x4<float>)),
                                       static_cast<uint32_t>(sizeof(Mat3x4<float>)), normal);
-      g_pushedNormalMatrix = normal;
     }
   }
   // A line or point program's texture coordinates the offset moves, from the view piece's mask.

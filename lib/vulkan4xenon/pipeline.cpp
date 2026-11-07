@@ -605,6 +605,7 @@ std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& confi
   pipeline->decodeFormat = decode::decode_format(pipeline->shaderConfig, pipeline->vertexLayout);
   pipeline->normalMatrix = programs.normalMatrix;
   pipeline->fogRange = programs.fogRange;
+  pipeline->uniformPieces = programs.uniformPieces;
   std::vector<VkVertexInputAttributeDescription> attributes;
   for (const auto& attribute : pipeline->vertexLayout.attributes) {
     attributes.push_back({

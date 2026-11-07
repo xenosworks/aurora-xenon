@@ -105,6 +105,8 @@ struct Programs {
   bool normalMatrix = false;
   // The fragment program samples the range fog table at set 2.
   bool fogRange = false;
+  // The uniform pieces the programs read, a bit each by gx::UniformPiece; only these are declared.
+  uint32_t uniformPieces = 0;
 };
 
 // All empty for a config these programs don't express yet, with all it needs logged once, under the config's hash.

@@ -293,6 +293,8 @@ struct Pipeline {
   bool normalMatrix = false;
   // The fragment program samples the range fog table (glsl.hpp).
   bool fogRange = false;
+  // The uniform pieces its programs read (glsl::Programs::uniformPieces); only those offsets matter to its draws.
+  uint32_t uniformPieces = gx::AllUniformPieces;
 
   Pipeline() noexcept = default;
   Pipeline(const Pipeline&) = delete;

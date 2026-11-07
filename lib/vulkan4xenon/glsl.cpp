@@ -179,12 +179,25 @@ std::array<Piece, gx::UniformPieceCount> pieces() {
   }};
 }
 
+// The pieces a program reads, a bit each by UniformPiece: those whose variable it names.
+uint32_t pieces_read(std::string_view program) {
+  const auto all = pieces();
+  uint32_t read = 0;
+  for (u32 i = 0; i < gx::UniformPieceCount; ++i) {
+    if (program.find(fmt::format("{}.", all[i].var)) != std::string_view::npos) {
+      read |= 1u << i;
+    }
+  }
+  return read;
+}
+
 // The blocks of the pieces a program reads, binding its UniformPiece, so the backend binds only what it reads.
 std::string uniform_blocks(std::string_view program) {
   std::string blocks;
   const auto all = pieces();
+  const uint32_t read = pieces_read(program);
   for (u32 i = 0; i < gx::UniformPieceCount; ++i) {
-    if (program.find(fmt::format("{}.", all[i].var)) != std::string_view::npos) {
+    if ((read >> i & 1) != 0) {
       std::string members = all[i].members;
       // View's last member, declared only where it's read, so the programs that don't read it keep their text.
       if (i == gx::UniformView && program.find("uview.depth_range") != std::string_view::npos) {
@@ -1406,6 +1419,8 @@ Programs build_programs(const gx::ShaderConfig& config) {
   programs.layout = make_layout(config, inputs);
   programs.vertex = vertex_source(plan, programs.layout, body, programs.normalMatrix);
   programs.fogRange = reads_fog_range(config, plan.info);
+  // The blocks the sources declare name no piece's variable followed by a dot, so this is what their bodies read.
+  programs.uniformPieces = pieces_read(programs.vertex) | pieces_read(programs.fragment);
   return programs;
 }
 
