@@ -216,13 +216,24 @@ struct LayOutStats {
   uint64_t decodedDraws = 0;
   uint64_t decodedVertices = 0;
   uint64_t forgetNs = 0;
-  // Placing by the time base: the draws that found their vertices, and those that didn't.
+  // Placing by the time base: the draws that found their vertices, and those that didn't, in the timed frames too.
   uint64_t hitTicks = 0;
   uint64_t missTicks = 0;
   uint64_t hits = 0;
   uint64_t misses = 0;
+  uint64_t timedHits = 0;
+  uint64_t timedMisses = 0;
 };
 LayOutStats g_layOut;
+
+// The frames whose short spans are timed: a time base read takes about 90 ns on the console, as long as a clock read,
+// and timing every Vulkan call and placed draw added about 1 us a draw (the first split's diagnostics), so one frame in
+// 16 is timed and every frame counted. The GX draws and their recording time in the timed frames.
+constexpr uint32_t TimedFrameInterval = 16;
+uint32_t g_frameNumber = 0;
+bool g_timedFrame = false;
+uint64_t g_timedDraws = 0;
+uint64_t g_timedRecordNs = 0;
 
 // What a clock read costs: each stage's time holds about one.
 double clock_read_ns() noexcept {
@@ -248,6 +259,7 @@ double tick_read_ticks() noexcept {
 struct VulkanCalls {
   const char* name;
   uint64_t calls = 0;
+  uint64_t timedCalls = 0;
   uint64_t ticks = 0;
 };
 std::vector<VulkanCalls*> g_vulkanCalls;
@@ -255,13 +267,16 @@ std::vector<VulkanCalls*> g_vulkanCalls;
 std::chrono::steady_clock::time_point g_windowStart = std::chrono::steady_clock::now();
 uint64_t g_windowTicks = decode::ticks();
 
-// A draw's placing time, by the time base, added to the hits' or the misses'.
+// A draw's placing, counted with the hits or the misses, and in a timed frame its time by the time base.
 struct PlaceTimer {
-  uint64_t start = decode::ticks();
+  uint64_t start = g_timedFrame ? decode::ticks() : 0;
   bool missed = false;
   ~PlaceTimer() {
-    (missed ? g_layOut.missTicks : g_layOut.hitTicks) += decode::ticks() - start;
     ++(missed ? g_layOut.misses : g_layOut.hits);
+    if (g_timedFrame) {
+      (missed ? g_layOut.missTicks : g_layOut.hitTicks) += decode::ticks() - start;
+      ++(missed ? g_layOut.timedMisses : g_layOut.timedHits);
+    }
   }
 };
 // The render worker's time in vkAcquireNextImageKHR, which waits for the display, since the benchmark last asked.
@@ -579,16 +594,21 @@ const backend::Pipeline* main_pipeline(PipelineRef ref) noexcept {
   return pipeline;
 }
 
-// A Vulkan call recording a pass's draws; with diagnostics, counted and timed by function.
+// A Vulkan call recording a pass's draws; with diagnostics, counted by function, and timed in a timed frame.
 template <auto Function, typename... Args>
 void record_call([[maybe_unused]] const char* name, Args... args) noexcept {
 #ifdef AURORA_DIAGNOSTICS
   static VulkanCalls stats{name};
   [[maybe_unused]] static const bool listed = (g_vulkanCalls.push_back(&stats), true);
+  ++stats.calls;
+  if (!g_timedFrame) {
+    Function(args...);
+    return;
+  }
   const uint64_t start = decode::ticks();
   Function(args...);
   stats.ticks += decode::ticks() - start;
-  ++stats.calls;
+  ++stats.timedCalls;
 #else
   Function(args...);
 #endif
@@ -733,13 +753,16 @@ VkDescriptorSet pass_fog_range(std::span<const uint8_t> storage, uint32_t base, 
   return set;
 }
 
-// A draw's pipeline, null until it exists; timed with diagnostics.
+// A draw's pipeline, null until it exists; with diagnostics, counted, and timed in a timed frame.
 const backend::Pipeline* look_up_pipeline(PipelineRef ref) noexcept {
 #ifdef AURORA_DIAGNOSTICS
+  ++g_layOut.lookups;
+  if (!g_timedFrame) {
+    return main_pipeline(ref);
+  }
   auto mark = std::chrono::steady_clock::now();
   const backend::Pipeline* pipeline = main_pipeline(ref);
   g_layOut.lookupNs += decode::lap(mark);
-  ++g_layOut.lookups;
   return pipeline;
 #else
   return main_pipeline(ref);
@@ -966,17 +989,17 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
   const VkDeviceSize offset = draw.offset;
   const VkDescriptorSet textures = frame_texture_set(data.bindGroups.textureBindGroup);
   if (textures != g_boundTextures) {
-    record_call<vkCmdBindDescriptorSets>("bind sets", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 1u, 1u,
+    record_call<vkCmdBindDescriptorSets>("bind textures", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 1u, 1u,
                                          &textures, 0u, nullptr);
     g_boundTextures = textures;
   }
   if (pipeline.fogRange && draw.fogRange != g_boundFogRange) {
-    record_call<vkCmdBindDescriptorSets>("bind sets", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout,
+    record_call<vkCmdBindDescriptorSets>("bind fog table", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout,
                                          glsl::FogRangeSet, 1u, &draw.fogRange, 0u, nullptr);
     g_boundFogRange = draw.fogRange;
   }
   if (g_boundUniforms != data.uniformOffsets) {
-    record_call<vkCmdBindDescriptorSets>("bind sets", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0u, 1u,
+    record_call<vkCmdBindDescriptorSets>("bind uniforms", cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0u, 1u,
                                          &state.uniformSet, static_cast<uint32_t>(data.uniformOffsets.size()),
                                          data.uniformOffsets.data());
     g_boundUniforms = data.uniformOffsets;
@@ -1330,8 +1353,13 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
 #ifdef AURORA_DIAGNOSTICS
     g_gxDraws += g_passDraws.size();
     g_layOutNs += std::chrono::duration_cast<std::chrono::nanoseconds>(recordStart - layOutStart).count();
-    g_recordNs +=
+    const auto recordNs =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - recordStart).count();
+    g_recordNs += recordNs;
+    if (g_timedFrame) {
+      g_timedDraws += g_passDraws.size();
+      g_timedRecordNs += recordNs;
+    }
 #endif
     if (multisampled != nullptr && depthRead) {
       resolve_depth(*depth, *readDepth, cmd);
@@ -1494,6 +1522,9 @@ void start_frame(detail::FramePacket& frame) noexcept {
     state.indicesCopied = 0;
     state.uploadsCopied = 0;
     state.verticesSkipped = 0;
+#ifdef AURORA_DIAGNOSTICS
+    g_timedFrame = ++g_frameNumber % TimedFrameInterval == 0;
+#endif
     // Every frame before this one has been submitted: its end item came first.
     g_cache.begin_frame(next_frame_serial());
     g_keys.begin_frame();
@@ -1585,6 +1616,7 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
         stats.peakUsedBytes / MiB, VertexCacheSize / MiB, stats.waits, stats.waitNs / 1e6, stats.longestWaitNs / 1e6,
         g_lists.take_built(), g_lists.size(), g_lists.bytes() / MiB);
     const double draws = static_cast<double>(std::max<uint64_t>(g_gxDraws, 1));
+    const double timedDraws = static_cast<double>(std::max<uint64_t>(g_timedDraws, 1));
     const auto keys = g_keys.take_stats();
     const auto helper = decode::take_helper_stats();
     const auto& layOut = g_layOut;
@@ -1595,7 +1627,7 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
         "{:.0f}), placing {:.0f}, decoding {:.0f} ({} draws, {} vertices; {} passes shared, {:.0f} us waiting for "
         "the helper), forgetting {:.0f}; a clock read takes {:.0f} ns",
         g_gxDraws, g_layOutNs / draws, g_recordNs / draws, layOut.passes, layOut.mostDraws, layOut.walkNs / draws,
-        layOut.lookups, layOut.lookupNs / draws, layOut.keysNs / draws, keys.gatherNs / draws, keys.lookups,
+        layOut.lookups, layOut.lookupNs / timedDraws, layOut.keysNs / draws, keys.gatherNs / draws, keys.lookups,
         keys.arrays, keys.hashNs / draws, keys.ranges, keys.hashedBytes / 1024, keys.keyNs / draws,
         layOut.placeNs / draws, layOut.decodeNs / draws, layOut.decodedDraws, layOut.decodedVertices, helper.passes,
         helper.waitNs / 1e3, layOut.forgetNs / draws, clock_read_ns());
@@ -1610,10 +1642,10 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
     };
     Log.info(
         "Laying out, last 1000 frames: placing {} draws that found their vertices at {:.0f} ns each and {} that "
-        "didn't at {:.0f}; work shared with the helper {} times, which started {:.0f} us after on average, did "
-        "{:.1f}% of the shared decodes' vertices, and was withdrawn {} times",
-        layOut.hits, each(layOut.hitTicks, layOut.hits), layOut.misses, each(layOut.missTicks, layOut.misses),
-        helper.shared,
+        "didn't at {:.0f}, timed in 1 frame of {}; work shared with the helper {} times, which started {:.0f} us "
+        "after on average, did {:.1f}% of the shared decodes' vertices, and was withdrawn {} times",
+        layOut.hits, each(layOut.hitTicks, layOut.timedHits), layOut.misses, each(layOut.missTicks, layOut.timedMisses),
+        TimedFrameInterval, helper.shared,
         helper.startNs / 1e3 / static_cast<double>(std::max<uint64_t>(helper.shared - helper.withdrawn, 1)),
         100.0 * static_cast<double>(helper.helperVertices) /
             static_cast<double>(std::max<uint64_t>(helper.vertices, 1)),
@@ -1626,6 +1658,7 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
           std::ranges::find_if(byName, [&](const auto& c) { return std::strcmp(c.name, calls->name) == 0; });
       auto& sum = it != byName.end() ? *it : byName.emplace_back(VulkanCalls{calls->name});
       sum.calls += calls->calls;
+      sum.timedCalls += calls->timedCalls;
       sum.ticks += calls->ticks;
       vulkanTicks += calls->ticks;
       *calls = VulkanCalls{calls->name};
@@ -1633,16 +1666,20 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
     std::string perCall;
     for (const auto& calls : byName) {
       fmt::format_to(std::back_inserter(perCall), "{}{} {:.2f} at {:.0f} ns", perCall.empty() ? "" : ", ", calls.name,
-                     static_cast<double>(calls.calls) / draws, each(calls.ticks, calls.calls));
+                     static_cast<double>(calls.calls) / draws, each(calls.ticks, calls.timedCalls));
     }
-    const double vulkanNs = static_cast<double>(vulkanTicks) * nsPerTick / draws;
+    const double vulkanNs = static_cast<double>(vulkanTicks) * nsPerTick / timedDraws;
+    const double timedRecordNs = static_cast<double>(g_timedRecordNs) / timedDraws;
     Log.info(
-        "Recording, last 1000 frames: a GX draw's {:.0f} ns, {:.0f} of it in vulkan4xenon's calls and {:.0f} in "
-        "Aurora's own; calls a draw: {}; a time base read takes {:.0f} ns",
-        g_recordNs / draws, vulkanNs, g_recordNs / draws - vulkanNs, perCall, tick_read_ticks() * nsPerTick);
+        "Recording, last 1000 frames: a GX draw's {:.0f} ns; in 1 frame of {}, timed by call, {:.0f}: {:.0f} in "
+        "vulkan4xenon's calls and {:.0f} in Aurora's own; calls a draw: {}; a time base read takes {:.0f} ns",
+        g_recordNs / draws, TimedFrameInterval, timedRecordNs, vulkanNs, timedRecordNs - vulkanNs, perCall,
+        tick_read_ticks() * nsPerTick);
     g_gxDraws = 0;
     g_layOutNs = 0;
     g_recordNs = 0;
+    g_timedDraws = 0;
+    g_timedRecordNs = 0;
     g_layOut = {};
   }
 #endif
