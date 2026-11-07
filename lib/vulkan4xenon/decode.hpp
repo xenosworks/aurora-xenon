@@ -203,7 +203,6 @@ public:
   void begin_frame() noexcept {
     absl::erase_if(m_arrayPlaces, [](const auto&) { return true; });
     m_arrays.clear();
-    m_arrayMemo.fill({0, NoRange});
   }
 
   // Each draw's key, or none, and where each of its arrays ends, for decode_vertices to say whether it read past one.
@@ -241,27 +240,10 @@ private:
     uint64_t hash;
   };
   static constexpr uint32_t Hashed = UINT32_MAX;
-
-  // The draw's layout's attributes read through an index into an array, in its order: worked out again only when the
-  // layout changes, as draws in a row often share one.
-  const std::vector<uint32_t>& indexed_attributes(const KeyedDraw& keyed);
-  // The place in m_arrays of the array at arrayStart in the storage pool, added when the frame first meets it.
-  uint32_t array_place(uint32_t arrayStart, std::span<const uint8_t> storage, bool poolHashes);
-
   // The frame's arrays, and their places in m_arrays by start in the frame's storage pool. Each draw keeps its
   // attributes' places (m_drawArrays, from m_drawArraysStart), so its key doesn't look them up again.
   std::vector<Array> m_arrays;
   absl::flat_hash_map<uint32_t, uint32_t> m_arrayPlaces;
-  // The arrays the frame found last, at their start's hash: a draw's arrays are most often its neighbours', found here
-  // without m_arrayPlaces's lookup. A place of NoRange is none.
-  static constexpr size_t ArrayMemoSize = 256;
-  std::array<std::pair<uint32_t, uint32_t>, ArrayMemoSize> m_arrayMemo = [] {
-    std::array<std::pair<uint32_t, uint32_t>, ArrayMemoSize> memo;
-    memo.fill({0, UINT32_MAX});
-    return memo;
-  }();
-  const VertexLayout* m_indexedLayout = nullptr;
-  std::vector<uint32_t> m_indexedAttributes;
   std::vector<uint32_t> m_drawArrays;
   std::vector<uint32_t> m_drawArraysStart;
   std::vector<HashRange> m_ranges;
